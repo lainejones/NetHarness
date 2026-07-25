@@ -84,6 +84,18 @@ struct IntuitionBase *IntuitionBase = NULL;
 struct GfxBase       *GfxBase       = NULL;
 struct Library       *SocketBase    = NULL;
 
+/* Diagnostics go to a file — the harness is normally launched `run >NIL:`,
+ * so printf is invisible.  `type T:netharness.log` on the Amiga to read. */
+#define NH_LOG_FILE "T:netharness.log"
+static void nh_log(const char *msg, LONG num)
+{
+    BPTR fh = Open((STRPTR)NH_LOG_FILE, MODE_READWRITE);
+    if (!fh) return;
+    Seek(fh, 0, OFFSET_END);
+    FPrintf(fh, (STRPTR)"%s %ld\n", (LONG)msg, num);
+    Close(fh);
+}
+
 static struct MsgPort  *inputmp;
 static struct IOStdReq *inputio;
 
@@ -456,13 +468,26 @@ int main(void)
     }
     if (g_listen < 0) {
         printf("netharness: could not bind TCP port %d (stack down?)\n", LISTEN_PORT);
+        nh_log("bind/listen failed after retries, errno", SocketBase ? Errno() : -1);
         goto cleanup_input;
     }
     printf("netharness: listening on port %d\n", LISTEN_PORT);
+    nh_log("listening on port", LISTEN_PORT);
 
     for (;;) {
-        g_client = accept(g_listen, NULL, NULL);
-        if (g_client < 0) continue;
+        struct sockaddr_in peer;
+        LONG peerlen = sizeof(peer);
+        /* Real addr buffer, not NULL: WinUAE's bsdsocket_emu tolerates
+         * accept(s,NULL,NULL) but a real stack may EFAULT on it.  And on ANY
+         * accept failure, sleep before retrying — a tight retry loop at our
+         * boosted priority would busy-lock the whole machine. */
+        g_client = accept(g_listen, (APTR)&peer, &peerlen);
+        if (g_client < 0) {
+            nh_log("accept failed, errno", Errno());
+            Delay(50);   /* 1s */
+            continue;
+        }
+        nh_log("client connected, fd", g_client);
         cmdbuf_len = 0;
 
         for (;;) {
