@@ -53,6 +53,9 @@
 #include <proto/exec.h>
 #include <proto/dos.h>
 #include <proto/intuition.h>
+#include <proto/graphics.h>
+#include <cybergraphx/cybergraphics.h>
+#include <proto/cybergraphics.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -83,6 +86,7 @@
 struct IntuitionBase *IntuitionBase = NULL;
 struct GfxBase       *GfxBase       = NULL;
 struct Library       *SocketBase    = NULL;
+struct Library       *CyberGfxBase  = NULL;   /* opened lazily on RTG capture */
 
 /* Diagnostics go to a file — the harness is normally launched `run >NIL:`,
  * so printf is invisible.  `type T:netharness.log` on the Amiga to read. */
@@ -238,39 +242,112 @@ static void do_reset_input(void)
 
 /* ---- screenshot --------------------------------------------------------- */
 
+/* v1.2: universal chunky capture via ReadPixelArray8 + the screen's real
+ * palette.  The old raw-bitplane path broke on RTG (zz9000/P96) screens:
+ * their BitMap is a chunky fake whose Planes[] aren't 8 valid bitplanes, so
+ * streaming bpr*height*depth "planar" bytes shipped garbage (24MB of it on a
+ * 1024x768x8 Workbench).  ReadPixelArray8 works on planar AGA AND P96 chunky
+ * alike, so this is now the only path.
+ *
+ * Chunky wire format (host detects via depth byte = 0xFF):
+ *   hdr:  0x81 width2 height2 0xFF stride2      (stride = width padded to 16)
+ *   then: ncolors2, ncolors*3 palette bytes (8-bit R,G,B per pen)
+ *   then: stride*height chunky pen bytes
+ * Screens deeper than 8 bpp send hdr depth byte 0xFE and nothing else. */
+#define SHOT_BAND_H 32
+
 static void do_screenshot(void)
 {
-    struct Screen *scr;
-    struct BitMap *bm;
-    UWORD width, height, bpr;
-    UBYTE depth, i;
-    UBYTE hdr[8];
+    struct Screen   *scr;
+    struct RastPort *rp;
+    struct RastPort  trp;
+    struct BitMap   *tmpbm = NULL;
+    UBYTE  *chunky = NULL;
+    static ULONG pal32[256 * 3];      /* static: keep main()'s stack small */
+    static UBYTE pal[2 + 256 * 3];
+    UWORD  width, height, stride, ncol;
+    ULONG  depth;
+    UWORD  y, i;
+    UBYTE  hdr[8];
 
     scr = IntuitionBase->ActiveScreen;
     if (!scr) scr = IntuitionBase->FirstScreen;
     if (!scr) return;
 
-    bm     = &scr->BitMap;
+    rp     = &scr->RastPort;
     width  = (UWORD)scr->Width;
     height = (UWORD)scr->Height;
-    depth  = bm->Depth;
-    bpr    = bm->BytesPerRow;
+    depth  = GetBitMapAttr(rp->BitMap, BMA_DEPTH);
+    stride = (UWORD)((width + 15) & ~15);   /* ReadPixelArray8 row padding */
 
     hdr[0] = RESP_SCREENSHOT_HDR;
     hdr[1] = (UBYTE)(width  >> 8); hdr[2] = (UBYTE)width;
     hdr[3] = (UBYTE)(height >> 8); hdr[4] = (UBYTE)height;
-    hdr[5] = depth;
-    hdr[6] = (UBYTE)(bpr    >> 8); hdr[7] = (UBYTE)bpr;
-    if (!send_all(hdr, sizeof(hdr))) return;
 
-    /* Over TCP there is no packet cap - send each whole plane in one go;
-     * send_all() handles the stack's own segmentation. */
-    for (i = 0; i < depth; i++) {
-        UBYTE *plane = (UBYTE *)bm->Planes[i];
-        LONG   plane_size = (LONG)bpr * height;
-        if (!plane) continue;
-        if (!send_all(plane, plane_size)) return;
+    if (depth > 8) {
+        /* True-colour RTG screen (Picasso96/zz9000 Workbench on this A4000):
+         * grab via cybergraphics.library ReadPixelArray in RECTFMT_RGB.
+         * Wire: depth byte 0xFD, then width*height*3 raw RGB bytes, no
+         * palette and no row padding. */
+        UBYTE *rgb;
+        UWORD  y;
+        if (!CyberGfxBase)
+            CyberGfxBase = OpenLibrary((STRPTR)"cybergraphics.library", 40);
+        if (!CyberGfxBase) {
+            hdr[5] = 0xFE; hdr[6] = 0; hdr[7] = 0;   /* unsupported */
+            send_all(hdr, sizeof(hdr));
+            return;
+        }
+        hdr[5] = 0xFD; hdr[6] = 0; hdr[7] = 0;
+        rgb = AllocVec((ULONG)width * 3 * SHOT_BAND_H, MEMF_PUBLIC);
+        if (!rgb) {
+            hdr[5] = 0xFE;
+            send_all(hdr, sizeof(hdr));
+            return;
+        }
+        if (send_all(hdr, sizeof(hdr))) {
+            for (y = 0; y < height; y += SHOT_BAND_H) {
+                UWORD bh = (UWORD)((height - y > SHOT_BAND_H) ? SHOT_BAND_H : height - y);
+                ReadPixelArray(rgb, 0, 0, (UWORD)(width * 3),
+                               rp, 0, y, width, bh, RECTFMT_RGB);
+                if (!send_all(rgb, (ULONG)width * 3 * bh)) break;
+            }
+        }
+        FreeVec(rgb);
+        return;
     }
+
+    hdr[5] = 0xFF;
+    hdr[6] = (UBYTE)(stride >> 8); hdr[7] = (UBYTE)stride;
+
+    chunky = AllocVec((ULONG)stride * SHOT_BAND_H, MEMF_PUBLIC);
+    tmpbm  = AllocBitMap(stride, SHOT_BAND_H, depth, 0, rp->BitMap);
+    if (!chunky || !tmpbm) goto out;
+    trp = *rp;
+    trp.Layer  = NULL;
+    trp.BitMap = tmpbm;
+
+    ncol = (UWORD)(1UL << depth);
+    GetRGB32(scr->ViewPort.ColorMap, 0, ncol, pal32);
+    pal[0] = (UBYTE)(ncol >> 8); pal[1] = (UBYTE)ncol;
+    for (i = 0; i < ncol; i++) {
+        pal[2 + i * 3 + 0] = (UBYTE)(pal32[i * 3 + 0] >> 24);
+        pal[2 + i * 3 + 1] = (UBYTE)(pal32[i * 3 + 1] >> 24);
+        pal[2 + i * 3 + 2] = (UBYTE)(pal32[i * 3 + 2] >> 24);
+    }
+
+    if (!send_all(hdr, sizeof(hdr))) goto out;
+    if (!send_all(pal, 2 + (ULONG)ncol * 3)) goto out;
+
+    for (y = 0; y < height; y += SHOT_BAND_H) {
+        UWORD bh = (UWORD)((height - y > SHOT_BAND_H) ? SHOT_BAND_H : height - y);
+        ReadPixelArray8(rp, 0, y, width - 1, y + bh - 1, chunky, &trp);
+        if (!send_all(chunky, (ULONG)stride * bh)) break;
+    }
+
+out:
+    if (tmpbm)  FreeBitMap(tmpbm);
+    if (chunky) FreeVec(chunky);
 }
 
 /* ---- EXEC ---------------------------------------------------------------- */

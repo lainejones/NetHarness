@@ -156,6 +156,30 @@ class NetHarness:
         if hdr[0] != RESP_SCREENSHOT_HDR:
             raise ConnectionError(f'expected screenshot hdr, got 0x{hdr[0]:02x}')
         width, height, depth, bpr = struct.unpack('>HHBH', hdr[1:8])
+
+        if depth == 0xFE:
+            raise RuntimeError('capture unsupported (no cybergraphics.library / no memory)')
+
+        if depth == 0xFD:
+            # True-colour RTG: raw RGB24, width*height*3, no padding.
+            from PIL import Image
+            data = self._recv_exactly(width * height * 3)
+            Image.frombytes('RGB', (width, height), data).save(path)
+            return path, width, height, 24
+
+        if depth == 0xFF:
+            # v1.2 chunky format: bpr = stride; then ncolors2 + palette + pens
+            stride = bpr
+            ncol = struct.unpack('>H', self._recv_exactly(2))[0]
+            palette = self._recv_exactly(ncol * 3)
+            data = self._recv_exactly(stride * height)
+            from PIL import Image
+            img = Image.frombytes('P', (stride, height), data)
+            img.putpalette(palette + bytes(3) * (256 - ncol))
+            img = img.crop((0, 0, width, height)).convert('RGB')
+            img.save(path)
+            return path, width, height, ncol
+
         planes = [self._recv_exactly(bpr * height) for _ in range(depth)]
 
         # planar -> chunky -> grayscale PNG.  Two subtleties:
