@@ -372,9 +372,10 @@ static void do_exec(const UBYTE *cmd, UWORD len)
          * them ourselves.  Child runs at priority 0 so a busy command can't
          * starve this task (which sits above it). */
         rc = SystemTags((STRPTR)cmdline,
-                        SYS_Input,   (Tag)in,
-                        SYS_Output,  (Tag)out,
-                        NP_Priority, (Tag)0,
+                        SYS_Input,    (Tag)in,
+                        SYS_Output,   (Tag)out,
+                        NP_Priority,  (Tag)0,
+                        NP_WindowPtr, (Tag)-1L,   /* no DOS requesters - see main() */
                         TAG_DONE);
         Close(out);
     }
@@ -410,6 +411,38 @@ static void do_exec(const UBYTE *cmd, UWORD len)
         Close(rd);
         DeleteFile((STRPTR)EXEC_OUT_FILE);
     }
+}
+
+/* ---- flush filesystems before a reset --------------------------------------
+ * ColdReboot() resets the machine INSTANTLY.  Any data still sitting in a
+ * filesystem's dirty buffers is lost - which silently threw away every file
+ * written shortly before a REBOOT (a library copied into LIBS: reverted to its
+ * previous contents after the reset, costing a long debugging detour on
+ * 2026-07-25).  Send ACTION_FLUSH to every mounted filesystem handler first.
+ *
+ * The handler ports are collected under the DosList lock and the packets sent
+ * AFTER unlocking: DoPkt() waits for a reply, and blocking while holding the
+ * DosList lock can deadlock against the handler itself. */
+#define ACTION_FLUSH 27
+#define MAX_FLUSH_PORTS 24
+
+static void flush_all_filesystems(void)
+{
+    struct MsgPort *ports[MAX_FLUSH_PORTS];
+    UWORD n = 0, i;
+    struct DosList *dl;
+
+    dl = LockDosList(LDF_DEVICES | LDF_READ);
+    if (dl) {
+        while ((dl = NextDosEntry(dl, LDF_DEVICES | LDF_READ)) != NULL) {
+            if (dl->dol_Task && n < MAX_FLUSH_PORTS)
+                ports[n++] = dl->dol_Task;
+        }
+        UnLockDosList(LDF_DEVICES | LDF_READ);
+    }
+    for (i = 0; i < n; i++)
+        DoPkt(ports[i], ACTION_FLUSH, 0, 0, 0, 0, 0);
+    Delay(25);   /* 0.5s: let drivers push their own write caches out */
 }
 
 /* ---- command stream reassembly -------------------------------------------
@@ -456,6 +489,7 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
             do_screenshot();
             return 1;
         case CMD_REBOOT:
+            flush_all_filesystems();   /* MUST precede ColdReboot - see below */
             ColdReboot();
             return 1;   /* unreachable */
         case CMD_EXEC:
@@ -526,6 +560,15 @@ int main(void)
     /* Modest boost: stay responsive above busy apps, but EXEC children are
      * explicitly started at 0 so they can't be starved by us either. */
     old_priority = SetTaskPri(FindTask(NULL), 20);
+
+    /* pr_WindowPtr = -1: make DOS FAIL instead of putting up a requester.
+     * Without this, any command touching a missing volume ("Please insert
+     * volume NAS: in any drive") blocks forever inside our synchronous
+     * System() call - and because this harness is single-threaded, that
+     * wedges the ENTIRE remote channel with no way to click the requester
+     * away (hit for real on 2026-07-25; needed a human at the machine).
+     * EXEC children inherit this. */
+    ((struct Process *)FindTask(NULL))->pr_WindowPtr = (APTR)-1L;
 
     IntuitionBase = (struct IntuitionBase *)OpenLibrary((STRPTR)"intuition.library", 37);
     GfxBase       = (struct GfxBase *)OpenLibrary((STRPTR)"graphics.library", 37);
