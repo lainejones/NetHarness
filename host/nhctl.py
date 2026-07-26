@@ -280,6 +280,14 @@ def run_command(nh, argv):
 
 
 def main():
+    # Amiga output can contain control/ANSI bytes (LhA's progress bar, for one)
+    # that a Windows cp1252 console refuses to encode, which would otherwise
+    # crash us AFTER the Amiga command already succeeded.
+    try:
+        sys.stdout.reconfigure(errors='replace')
+        sys.stderr.reconfigure(errors='replace')
+    except AttributeError:
+        pass
     argv = sys.argv[1:]
     host, port = DEFAULT_HOST, DEFAULT_PORT
     while argv and argv[0].startswith('--'):
