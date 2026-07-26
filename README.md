@@ -49,12 +49,24 @@ nhctl.py EXEC 'rx "address IBROWSE; ''GOTOURL https://aminet.net''"'
 **On the Amiga** (needs a TCP/IP stack — Roadshow, AmiTCP, Miami, a314bsd…):
 
 ```
-Copy netharness C:
+Execute Install
 Run >NIL: C:netharness
 ```
 
 It listens on TCP port **7800**. To start it at every boot, add that `Run` line
 to the end of `S:User-Startup`, after your TCP/IP stack comes up.
+
+Use the installer rather than copying by hand, especially if you unpacked the
+**.zip**: ZIP archives cannot carry AmigaDOS protection bits, so `netharness`
+arrives without its `e` (executable) flag and the Shell refuses to run it. The
+installer sets the flag for you; to do it manually:
+
+```
+Copy netharness C:
+Protect C:netharness +e
+```
+
+The `.lha` archive preserves the flag, so it needs no such fixup.
 
 **On the controlling machine** (Python 3, plus Pillow for screenshots):
 
