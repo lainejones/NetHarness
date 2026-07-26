@@ -1,3 +1,8 @@
 amiga/netharness
-*.png
+*.o
+*.lha
+*.zip
+dist/
 __pycache__/
+*.png
+relnotes*.md

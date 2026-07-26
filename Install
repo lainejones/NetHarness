@@ -1,0 +1,36 @@
+;
+; NetHarness installer  -  Execute Install
+;
+; Copies the Amiga side into C: and offers the User-Startup line.
+;
+FAILAT 21
+
+ECHO "*NNetHarness installer"
+ECHO "----------------------"
+
+IF NOT EXISTS netharness
+  ECHO "*NError: run this from the drawer that contains the netharness program."
+  QUIT 10
+ENDIF
+
+ECHO ""
+ECHO "Copying netharness to C: ..."
+COPY netharness C: CLONE
+IF WARN
+  ECHO "Error: could not copy netharness to C:"
+  QUIT 10
+ENDIF
+PROTECT C:netharness +e
+ECHO "  done."
+
+ECHO ""
+ECHO "Installed.  Start it with:"
+ECHO ""
+ECHO "    Run >NIL: C:netharness"
+ECHO ""
+ECHO "It listens on TCP port 7800.  To start it at every boot, add that line"
+ECHO "to the END of S:User-Startup, AFTER your TCP/IP stack has started."
+ECHO ""
+ECHO "Then from another machine:"
+ECHO "    python3 nhctl.py --host <this-amiga-ip> PING"
+ECHO ""

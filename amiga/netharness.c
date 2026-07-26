@@ -59,10 +59,9 @@
 #include <string.h>
 #include <stdio.h>
 
-#include <netinclude/sys/socket.h>
-#include <netinclude/netinet/in.h>
-#include <netinclude/sys/select.h>
-#include <inline/bsdsocket.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <proto/bsdsocket.h>
 
 #define LISTEN_PORT 7800
 
@@ -521,8 +520,9 @@ static LONG g_listen = -1;
 
 static BOOL server_up(void)
 {
-    struct sockaddr_in sa;
+    volatile UBYTE sabuf[16];   /* raw sockaddr_in - see the note below */
     LONG one = 1;
+    UWORD i;
 
     if (!SocketBase) {
         SocketBase = OpenLibrary((STRPTR)"bsdsocket.library", 4);
@@ -534,12 +534,17 @@ static BOOL server_up(void)
 
     setsockopt(g_listen, SOL_SOCKET, SO_REUSEADDR, (APTR)&one, sizeof(one));
 
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family      = AF_INET;
-    sa.sin_port        = LISTEN_PORT;
-    sa.sin_addr.s_addr = 0;   /* INADDR_ANY */
+    /* Build the sockaddr as VOLATILE BYTES rather than struct fields: at -O2
+     * this compiler can merge the adjacent 16-bit stores of sin_family and
+     * sin_port into one 32-bit store and drop the family, leaving a sockaddr
+     * the stack rejects with EAFNOSUPPORT.  Layout is family(2) port(2)
+     * addr(4), big-endian throughout on 68k; addr 0 = INADDR_ANY. */
+    for (i = 0; i < 16; i++) sabuf[i] = 0;
+    sabuf[1] = AF_INET;
+    sabuf[2] = (UBYTE)(LISTEN_PORT >> 8);
+    sabuf[3] = (UBYTE)LISTEN_PORT;
 
-    if (bind(g_listen, (APTR)&sa, sizeof(sa)) < 0 ||
+    if (bind(g_listen, (struct sockaddr *)sabuf, 16) < 0 ||
         listen(g_listen, 1) < 0) {
         CloseSocket(g_listen);
         g_listen = -1;
@@ -595,13 +600,13 @@ int main(void)
     nh_log("listening on port", LISTEN_PORT);
 
     for (;;) {
-        struct sockaddr_in peer;
-        LONG peerlen = sizeof(peer);
+        UBYTE peer[16];
+        socklen_t peerlen = (socklen_t)sizeof(peer);
         /* Real addr buffer, not NULL: WinUAE's bsdsocket_emu tolerates
          * accept(s,NULL,NULL) but a real stack may EFAULT on it.  And on ANY
          * accept failure, sleep before retrying — a tight retry loop at our
          * boosted priority would busy-lock the whole machine. */
-        g_client = accept(g_listen, (APTR)&peer, &peerlen);
+        g_client = accept(g_listen, (struct sockaddr *)peer, &peerlen);
         if (g_client < 0) {
             nh_log("accept failed, errno", Errno());
             Delay(50);   /* 1s */
