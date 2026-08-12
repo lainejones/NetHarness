@@ -22,8 +22,27 @@ Commands (same verbs as the A314 harness ctl.py, plus EXEC):
   RESETINPUT                release any held buttons/qualifiers
   REBOOT                    ColdReboot() - connection drops, machine restarts
 
+v1.3 - stop guessing pixels:
+  POINTER                   where is the pointer really? (x y on WxH)
+  UITREE                    dump windows + gadgets of the front screen
+  MENUS                     dump the front window's menu strip
+  SCREENS                   list open screens, front to back
+  UICLICK <text>            click the gadget whose label/contents match <text>
+                            (substring, case-insensitive) - no coordinates
+  UICLICKID <id>            click the gadget with that GadgetID
+  MENUSEL <menu> <item>     pick a menu item by NAME (substring match)
+  SHOTREGION x y w h [out]  capture just a region
+  REGIONSUM x y w h         4-byte checksum of a region
+  WAITCHANGE x y w h [secs] block until that region's checksum changes
+  GETFILE <amiga> <local>   copy a file off the Amiga
+  PUTFILE <local> <amiga>   copy a file onto the Amiga (deploy a binary!)
+
 Every input command waits for the Amiga's RESP_ACK, so "OK" here means
 DELIVERED AND INJECTED (the fix for the A1200 harness's biggest blind spot).
+MOVETO/CLICK are CLOSED-LOOP: after the jump we read the pointer back and
+correct it, because Intuition's mouse acceleration mangles a one-shot relative
+delta - the root cause of countless "the click landed a few pixels off and you
+can't see why" failures (the pointer is an invisible hardware sprite).
 """
 
 import socket
@@ -36,10 +55,14 @@ DEFAULT_PORT = 7800
 
 CMD_MOUSE_MOVE, CMD_MOUSE_BUTTON, CMD_KEY, CMD_HOME_MOUSE = 1, 2, 3, 4
 CMD_SCREENSHOT, CMD_REBOOT, CMD_RESET_INPUT, CMD_EXEC, CMD_PING = 5, 6, 7, 8, 9
+CMD_POINTER, CMD_UITREE, CMD_MENUS, CMD_SCREENS = 10, 11, 12, 13
+CMD_REGION_SUM, CMD_SHOT_REGION, CMD_GETFILE, CMD_PUTFILE = 14, 15, 16, 17
 RESP_SCREENSHOT_HDR, RESP_ACK, RESP_EXEC = 0x81, 0x82, 0x83
+RESP_POINTER, RESP_TEXT, RESP_FILE, RESP_SUM = 0x84, 0x85, 0x86, 0x87
 
 SHIFT_CODE = 0x60
 RAWKEY_RIGHT, RAWKEY_BACKSPACE, RAWKEY_RETURN = 0x4E, 0x41, 0x44
+RAWKEY_RAMIGA = 0x67        # right Amiga = the menu-shortcut qualifier
 
 # Raw Amiga USA keymap (char -> (code, needs_shift)) - ported verbatim from
 # A314TestHarness/pi/testharness.py.
@@ -105,9 +128,61 @@ class NetHarness:
     def move(self, dx, dy):
         self._input_cmd(bytes([CMD_MOUSE_MOVE]) + struct.pack('>hh', dx, dy))
 
-    def move_to(self, x, y):
+    def pointer(self):
+        """Actual pointer position -> (x, y, screen_w, screen_h)."""
+        self.sock.sendall(bytes([CMD_POINTER]))
+        r = self._recv_exactly(9)
+        if r[0] != RESP_POINTER:
+            raise ConnectionError(f'expected pointer response, got 0x{r[0]:02x}')
+        return struct.unpack('>hhhh', r[1:9])
+
+    # Intuition's mouse acceleration multiplies any delta of 4 or more (~4x on
+    # a default A4000 setup); deltas of 3 or less pass through UNSCALED.  Both
+    # facts are load-bearing below - measured, not assumed.
+    ACCEL_FREE = 3          # largest delta that is never accelerated
+    MOVE_CAP   = 2000       # never request more than this (overflow guard)
+
+    def move_to(self, x, y, rounds=60):
+        """CLOSED-LOOP absolute move, correct with acceleration on or off.
+
+        Two phases:
+          coarse - request (remaining / gain) where `gain` is LEARNED from how
+                   far the pointer actually moved last hop.  Starts at 4 (the
+                   typical accelerated ratio); with acceleration off it
+                   measures 1 after one hop and converges immediately.
+          fine   - once within ACCEL_FREE px, step by <=3 at a time, which
+                   Intuition passes through 1:1, so we land exactly.
+
+        Why this matters: a single large delta is scaled AND can overflow the
+        signed 16-bit maths, flinging the pointer into the opposite corner -
+        after which every click silently lands in the wrong place.  Reading the
+        pointer back after each hop makes that impossible to miss."""
         self.home()
-        self.move(x, y)
+        px, py = self.pointer()[:2]
+        gain = 4.0
+        for _ in range(rounds):
+            dx, dy = x - px, y - py
+            if dx == 0 and dy == 0:
+                return True
+            if abs(dx) <= self.ACCEL_FREE and abs(dy) <= self.ACCEL_FREE:
+                rx, ry = dx, dy                       # fine: 1:1, lands exact
+            else:
+                rx = int(dx / gain) or (1 if dx > 0 else -1 if dx else 0)
+                ry = int(dy / gain) or (1 if dy > 0 else -1 if dy else 0)
+                rx = max(-self.MOVE_CAP, min(self.MOVE_CAP, rx))
+                ry = max(-self.MOVE_CAP, min(self.MOVE_CAP, ry))
+            self.move(rx, ry)
+            nx, ny, _w, _h = self.pointer()
+            moved, asked = abs(nx - px) + abs(ny - py), abs(rx) + abs(ry)
+            # learn the real gain from a coarse hop that wasn't edge-clamped
+            if asked > self.ACCEL_FREE and moved:
+                g = moved / asked
+                if 0.2 <= g <= 16:
+                    gain = (gain + g) / 2.0
+            if (nx, ny) == (px, py) and asked:
+                break                                  # clamped at an edge
+            px, py = nx, ny
+        return (px, py) == (x, y)
 
     def button(self, b, down):
         self._input_cmd(bytes([CMD_MOUSE_BUTTON, b, 1 if down else 0]))
@@ -146,12 +221,174 @@ class NetHarness:
     def reset_input(self):
         self._input_cmd(bytes([CMD_RESET_INPUT]))
 
+    # ---- semantic layer: address things by WHAT THEY ARE ----------------------
+
+    def _text_cmd(self, cmd):
+        self.sock.sendall(bytes([cmd]))
+        hdr = self._recv_exactly(5)
+        if hdr[0] != RESP_TEXT:
+            raise ConnectionError(f'expected text response, got 0x{hdr[0]:02x}')
+        n = struct.unpack('>I', hdr[1:5])[0]
+        return self._recv_exactly(n).decode('latin-1', 'replace') if n else ''
+
+    def ui_tree(self):
+        return self._text_cmd(CMD_UITREE)
+
+    def menus(self):
+        return self._text_cmd(CMD_MENUS)
+
+    def screens(self):
+        return self._text_cmd(CMD_SCREENS)
+
+    @staticmethod
+    def _split_record(line):
+        """Split a UITREE line into fields, keeping "quoted strings" whole."""
+        out, cur, inq = [], '', False
+        for ch in line:
+            if ch == '"':
+                inq = not inq
+                if not inq:
+                    out.append(cur); cur = ''
+            elif inq:
+                cur += ch
+            elif ch == ' ':
+                if cur:
+                    out.append(cur); cur = ''
+            else:
+                cur += ch
+        if cur:
+            out.append(cur)
+        return out
+
+    def gadgets(self):
+        """Parse UITREE into [{id,kind,x,y,w,h,label,text}] (screen coords)."""
+        found = []
+        for line in self.ui_tree().splitlines():
+            if not line.startswith('G '):
+                continue
+            f = self._split_record(line[2:])
+            if len(f) < 6:
+                continue
+            try:
+                gid, kind = int(f[0]), f[1]
+                x, y, w, h = (int(f[2]), int(f[3]), int(f[4]), int(f[5]))
+            except ValueError:
+                continue
+            label = f[6] if len(f) > 6 else ''
+            text = f[7] if len(f) > 7 else ''
+            found.append(dict(id=gid, kind=kind, x=x, y=y, w=w, h=h,
+                              label=label, text=text))
+        return found
+
+    def find_gadget(self, needle=None, gid=None):
+        want = (needle or '').strip().lower()
+        for g in self.gadgets():
+            if gid is not None:
+                if g['id'] == gid:
+                    return g
+            elif want and (want in g['label'].lower() or want in g['text'].lower()):
+                return g
+        return None
+
+    def ui_click(self, needle=None, gid=None, button=0):
+        """Click a gadget by identity instead of guessing pixels."""
+        g = self.find_gadget(needle, gid)
+        if not g:
+            return None
+        cx, cy = g['x'] + g['w'] // 2, g['y'] + g['h'] // 2
+        self.click(cx, cy, button)
+        return g
+
+    def menu_select(self, menu_name, item_name):
+        """Pick a menu item by NAME.  Uses its keyboard shortcut when it has
+        one (far more reliable than driving the dropdown with the pointer)."""
+        mtitle, want_m, want_i = None, menu_name.lower(), item_name.lower()
+        for line in self.menus().splitlines():
+            if line.startswith('M '):
+                f = self._split_record(line[2:])
+                mtitle = f[1] if len(f) > 1 else ''
+            elif line.startswith('I ') and mtitle and want_m in mtitle.lower():
+                f = self._split_record(line[2:])
+                if len(f) < 3:
+                    continue
+                itext = f[2]
+                short = f[3] if len(f) > 3 else ''
+                if want_i in itext.lower():
+                    if short:
+                        # RIGHT Amiga (0x67) is the menu-shortcut qualifier;
+                        # 0x66 is LEFT Amiga and does nothing here.
+                        self.key(RAWKEY_RAMIGA, True)
+                        entry = KEYMAP.get(short.lower())
+                        if entry:
+                            self.press_key(entry[0])
+                        self.key(RAWKEY_RAMIGA, False)
+                        return itext
+                    return None      # no shortcut: caller must drive the menu
+        return None
+
+    # ---- regions: cheap "has it redrawn yet?" --------------------------------
+
+    def region_sum(self, x, y, w, h):
+        self.sock.sendall(bytes([CMD_REGION_SUM]) + struct.pack('>hhhh', x, y, w, h))
+        r = self._recv_exactly(5)
+        if r[0] != RESP_SUM:
+            raise ConnectionError(f'expected sum, got 0x{r[0]:02x}')
+        return struct.unpack('>I', r[1:5])[0]
+
+    def wait_change(self, x, y, w, h, timeout=10.0, poll=0.15):
+        """Block until the region's checksum changes.  Replaces the blind
+        fixed settle delay with an actual observation."""
+        start = self.region_sum(x, y, w, h)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(poll)
+            if self.region_sum(x, y, w, h) != start:
+                return True
+        return False
+
+    # ---- file transfer -------------------------------------------------------
+
+    def get_file(self, amiga_path, local_path):
+        p = amiga_path.encode('latin-1')
+        self.sock.sendall(bytes([CMD_GETFILE]) + struct.pack('>H', len(p)) + p)
+        hdr = self._recv_exactly(9)
+        if hdr[0] != RESP_FILE:
+            raise ConnectionError(f'expected file response, got 0x{hdr[0]:02x}')
+        status, n = struct.unpack('>iI', hdr[1:9])
+        if status != 0:
+            raise RuntimeError(f'Amiga could not open {amiga_path} (status {status})')
+        data = self._recv_exactly(n) if n else b''
+        with open(local_path, 'wb') as f:
+            f.write(data)
+        return n
+
+    def put_file(self, local_path, amiga_path, timeout=180):
+        with open(local_path, 'rb') as f:
+            data = f.read()
+        p = amiga_path.encode('latin-1')
+        old = self.sock.gettimeout()
+        self.sock.settimeout(timeout)
+        self.sock.sendall(bytes([CMD_PUTFILE]) + struct.pack('>H', len(p)) + p +
+                          struct.pack('>I', len(data)) + data)
+        hdr = self._recv_exactly(9)
+        self.sock.settimeout(old)
+        if hdr[0] != RESP_FILE:
+            raise ConnectionError(f'expected file response, got 0x{hdr[0]:02x}')
+        status, _ = struct.unpack('>iI', hdr[1:9])
+        if status != 0:
+            raise RuntimeError(f'Amiga could not write {amiga_path} (status {status})')
+        return len(data)
+
     # ---- screenshot ----------------------------------------------------------
 
-    def screenshot(self, path='nh_shot.png', settle=0.15):
+    def screenshot(self, path='nh_shot.png', settle=0.15, region=None):
         if settle:
             time.sleep(settle)   # let Intuition's async redraw finish
-        self.sock.sendall(bytes([CMD_SCREENSHOT]))
+        if region:
+            x, y, w, h = region
+            self.sock.sendall(bytes([CMD_SHOT_REGION]) + struct.pack('>hhhh', x, y, w, h))
+        else:
+            self.sock.sendall(bytes([CMD_SCREENSHOT]))
         hdr = self._recv_exactly(8)
         if hdr[0] != RESP_SCREENSHOT_HDR:
             raise ConnectionError(f'expected screenshot hdr, got 0x{hdr[0]:02x}')
@@ -248,7 +485,13 @@ def run_command(nh, argv):
     elif cmd == 'MOVE':
         nh.move(int(args[0]), int(args[1])); print('OK')
     elif cmd == 'MOVETO':
-        nh.move_to(int(args[0]), int(args[1])); print('OK')
+        x, y = int(args[0]), int(args[1])
+        if nh.move_to(x, y):
+            print('OK')
+        else:
+            px, py, _w, _h = nh.pointer()
+            print(f'FAILED: wanted {x},{y} but pointer is {px},{py}')
+            return 1
     elif cmd == 'BUTTON':
         nh.button(int(args[0]), bool(int(args[1]))); print('OK')
     elif cmd == 'CLICK':
@@ -266,6 +509,46 @@ def run_command(nh, argv):
     elif cmd == 'SCREENSHOT':
         path, w, h, d = nh.screenshot(args[0] if args else 'nh_shot.png')
         print(f'OK {path} {w}x{h}x{d}')
+    elif cmd == 'POINTER':
+        x, y, w, h = nh.pointer(); print(f'OK pointer {x} {y} on {w}x{h}')
+    elif cmd == 'UITREE':
+        print(nh.ui_tree(), end='')
+    elif cmd == 'MENUS':
+        print(nh.menus(), end='')
+    elif cmd == 'SCREENS':
+        print(nh.screens(), end='')
+    elif cmd == 'UICLICK':
+        g = nh.ui_click(needle=' '.join(args))
+        print(f'OK clicked id={g["id"]} {g["kind"]} "{g["label"]}" at {g["x"]},{g["y"]}'
+              if g else 'FAILED: no gadget matched')
+        return 0 if g else 1
+    elif cmd == 'UICLICKID':
+        g = nh.ui_click(gid=int(args[0]))
+        print(f'OK clicked id={g["id"]} {g["kind"]} "{g["label"]}"'
+              if g else 'FAILED: no gadget with that id')
+        return 0 if g else 1
+    elif cmd == 'MENUSEL':
+        it = nh.menu_select(args[0], ' '.join(args[1:]))
+        print(f'OK selected "{it}"' if it else 'FAILED: no match (or item has no shortcut)')
+        return 0 if it else 1
+    elif cmd == 'SHOTREGION':
+        x, y, w, h = (int(a) for a in args[:4])
+        out = args[4] if len(args) > 4 else 'nh_region.png'
+        path, rw, rh, d = nh.screenshot(out, region=(x, y, w, h))
+        print(f'OK {path} {rw}x{rh}x{d}')
+    elif cmd == 'REGIONSUM':
+        x, y, w, h = (int(a) for a in args[:4])
+        print(f'OK sum {nh.region_sum(x, y, w, h):08x}')
+    elif cmd == 'WAITCHANGE':
+        x, y, w, h = (int(a) for a in args[:4])
+        secs = float(args[4]) if len(args) > 4 else 10.0
+        ok = nh.wait_change(x, y, w, h, timeout=secs)
+        print('OK changed' if ok else f'TIMEOUT after {secs}s (no change)')
+        return 0 if ok else 1
+    elif cmd == 'GETFILE':
+        n = nh.get_file(args[0], args[1]); print(f'OK got {n} bytes -> {args[1]}')
+    elif cmd == 'PUTFILE':
+        n = nh.put_file(args[0], args[1]); print(f'OK put {n} bytes -> {args[1]}')
     elif cmd == 'EXEC':
         rc, out = nh.exec_cmd(' '.join(args))
         print(f'rc={rc}')

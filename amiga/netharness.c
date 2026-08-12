@@ -26,6 +26,15 @@
  *     CMD_RESET_INPUT  = 7   payload: none            (release held buttons/quals)
  *     CMD_EXEC         = 8   payload: len2 cmdline[len]  (AmigaDOS command)
  *     CMD_PING         = 9   payload: none
+ *   v1.3 additions (see "semantic layer" below):
+ *     CMD_POINTER      = 10  payload: none            (where IS the pointer?)
+ *     CMD_UITREE       = 11  payload: none            (windows+gadgets, text)
+ *     CMD_MENUS        = 12  payload: none            (menu strip, text)
+ *     CMD_SCREENS      = 13  payload: none            (open screens, text)
+ *     CMD_REGION_SUM   = 14  payload: x2 y2 w2 h2     (checksum a region)
+ *     CMD_SHOT_REGION  = 15  payload: x2 y2 w2 h2     (partial screenshot)
+ *     CMD_GETFILE      = 16  payload: len2 path[len]
+ *     CMD_PUTFILE      = 17  payload: plen2 path[plen] dlen4 data[dlen]
  *
  *   Amiga -> host:
  *     RESP_SCREENSHOT_HDR = 0x81  payload: width2 height2 depth1 bpr2, then
@@ -34,6 +43,20 @@
  *       and for CMD_PING.
  *     RESP_EXEC           = 0x83  payload: rc4 outlen4, then outlen bytes of
  *       the command's captured output.
+ *     RESP_POINTER        = 0x84  payload: x2 y2 scrw2 scrh2 (screen-relative)
+ *     RESP_TEXT           = 0x85  payload: len4 text[len]   (UITREE/MENUS/SCREENS)
+ *     RESP_FILE           = 0x86  payload: status4 len4 data[len] (status 0 = ok)
+ *     RESP_SUM            = 0x87  payload: sum4
+ *
+ * WHY THE SEMANTIC LAYER (v1.3): driving a GUI by pixel coordinates is the
+ * single biggest source of wasted time with this harness — the pointer is an
+ * invisible hardware sprite, and MOVETO's one-shot relative jump gets mangled
+ * by Intuition's mouse acceleration, so clicks silently land on the wrong row
+ * or a few pixels off a gadget and you cannot see why.  CMD_POINTER makes
+ * positioning CLOSED-LOOP (move, read back where you actually are, correct),
+ * and CMD_UITREE/CMD_MENUS let the controller address things by WHAT THEY ARE
+ * ("the Insert button") instead of guessing where they are.  (Same idea as
+ * thomas-luebker/amimcp's amiga_ui_tree / amiga_ui_click.)
  *
  * The Amiga side is single-threaded, so responses never interleave.
  *
@@ -63,7 +86,17 @@
 #include <netinet/in.h>
 #include <proto/bsdsocket.h>
 
-#define LISTEN_PORT 7800
+#define LISTEN_PORT 7800            /* default; override with an argv port */
+
+/* Standard AmigaDOS version cookie, so `version C:netharness` reports the
+ * build instead of "Could not find version information" — with the harness
+ * deployed on several machines, "which build is on this one?" needs to be a
+ * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
+ * BUMP NH_VERSION whenever the wire protocol or commands change. */
+#define NH_VERSION "1.3"
+#define NH_VERDATE "11.08.2026"
+static const char verstag[] __attribute__((used)) =
+    "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
 
 #define CMD_MOUSE_MOVE    1
 #define CMD_MOUSE_BUTTON  2
@@ -74,10 +107,22 @@
 #define CMD_RESET_INPUT   7
 #define CMD_EXEC          8
 #define CMD_PING          9
+#define CMD_POINTER      10
+#define CMD_UITREE       11
+#define CMD_MENUS        12
+#define CMD_SCREENS      13
+#define CMD_REGION_SUM   14
+#define CMD_SHOT_REGION  15
+#define CMD_GETFILE      16
+#define CMD_PUTFILE      17
 
 #define RESP_SCREENSHOT_HDR 0x81
 #define RESP_ACK            0x82
 #define RESP_EXEC           0x83
+#define RESP_POINTER        0x84
+#define RESP_TEXT           0x85
+#define RESP_FILE           0x86
+#define RESP_SUM            0x87
 
 #define EXEC_CMD_MAX   512          /* max AmigaDOS command line we accept */
 #define EXEC_OUT_FILE  "T:netharness.out"
@@ -224,9 +269,19 @@ static void do_key(UBYTE keycode, UBYTE down)
 
 static void do_home_mouse(void)
 {
-    /* No "set absolute" event exists - a saturating negative delta pins the
-     * pointer at (0,0) as a known origin. */
-    do_mouse_move(-16384, -16384);
+    /* No "set absolute" event exists, so we walk the pointer into the top-left
+     * corner and let Intuition clamp it there.
+     *
+     * NOT one big -16384 delta (what v1.2 did): with mouse ACCELERATION
+     * enabled, Intuition scales the delta, and a value that large overflows
+     * the signed 16-bit maths — the pointer wraps and slams into the BOTTOM
+     * RIGHT corner instead, after which every MOVETO is wrong and nothing
+     * looks broken (found the hard way 2026-08 by toggling Acceleration on
+     * during a UI test).  Many modest deltas can't overflow however they are
+     * scaled, so this is correct with acceleration on or off. */
+    UWORD i;
+    for (i = 0; i < 40; i++)
+        do_mouse_move(-1000, -1000);
 }
 
 static void do_reset_input(void)
@@ -255,7 +310,10 @@ static void do_reset_input(void)
  * Screens deeper than 8 bpp send hdr depth byte 0xFE and nothing else. */
 #define SHOT_BAND_H 32
 
-static void do_screenshot(void)
+/* x0/y0/width/height select a REGION of the front screen; the full-screen
+ * CMD_SCREENSHOT passes the whole thing.  Grabbing just a status line instead
+ * of a 3 MB frame is what makes polling for a redraw affordable. */
+static void do_screenshot_region(WORD x0, WORD y0, WORD rw, WORD rh)
 {
     struct Screen   *scr;
     struct RastPort *rp;
@@ -273,9 +331,16 @@ static void do_screenshot(void)
     if (!scr) scr = IntuitionBase->FirstScreen;
     if (!scr) return;
 
-    rp     = &scr->RastPort;
-    width  = (UWORD)scr->Width;
-    height = (UWORD)scr->Height;
+    rp = &scr->RastPort;
+    /* clamp the requested region to the screen */
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (rw <= 0 || rw > scr->Width  - x0) rw = (WORD)(scr->Width  - x0);
+    if (rh <= 0 || rh > scr->Height - y0) rh = (WORD)(scr->Height - y0);
+    if (rw <= 0 || rh <= 0) return;
+
+    width  = (UWORD)rw;
+    height = (UWORD)rh;
     depth  = GetBitMapAttr(rp->BitMap, BMA_DEPTH);
     stride = (UWORD)((width + 15) & ~15);   /* ReadPixelArray8 row padding */
 
@@ -308,7 +373,7 @@ static void do_screenshot(void)
             for (y = 0; y < height; y += SHOT_BAND_H) {
                 UWORD bh = (UWORD)((height - y > SHOT_BAND_H) ? SHOT_BAND_H : height - y);
                 ReadPixelArray(rgb, 0, 0, (UWORD)(width * 3),
-                               rp, 0, y, width, bh, RECTFMT_RGB);
+                               rp, x0, y0 + y, width, bh, RECTFMT_RGB);
                 if (!send_all(rgb, (ULONG)width * 3 * bh)) break;
             }
         }
@@ -340,7 +405,7 @@ static void do_screenshot(void)
 
     for (y = 0; y < height; y += SHOT_BAND_H) {
         UWORD bh = (UWORD)((height - y > SHOT_BAND_H) ? SHOT_BAND_H : height - y);
-        ReadPixelArray8(rp, 0, y, width - 1, y + bh - 1, chunky, &trp);
+        ReadPixelArray8(rp, x0, y0 + y, x0 + width - 1, y0 + y + bh - 1, chunky, &trp);
         if (!send_all(chunky, (ULONG)stride * bh)) break;
     }
 
@@ -410,6 +475,375 @@ static void do_exec(const UBYTE *cmd, UWORD len)
         Close(rd);
         DeleteFile((STRPTR)EXEC_OUT_FILE);
     }
+}
+
+/* ---- v1.3: pointer readback, semantic UI tree, regions, file transfer ----- */
+
+static struct Screen *front_screen(void)
+{
+    struct Screen *scr = IntuitionBase->ActiveScreen;
+    if (!scr) scr = IntuitionBase->FirstScreen;
+    return scr;
+}
+
+/* Where IS the pointer?  The sprite never shows up in a screenshot, so without
+ * this the controller is flying blind after every move. */
+static void do_pointer(void)
+{
+    struct Screen *scr = front_screen();
+    UBYTE r[9];
+    WORD x = 0, y = 0, w = 0, h = 0;
+    if (scr) { x = scr->MouseX; y = scr->MouseY; w = scr->Width; h = scr->Height; }
+    r[0] = RESP_POINTER;
+    r[1] = (UBYTE)(x >> 8); r[2] = (UBYTE)x;
+    r[3] = (UBYTE)(y >> 8); r[4] = (UBYTE)y;
+    r[5] = (UBYTE)(w >> 8); r[6] = (UBYTE)w;
+    r[7] = (UBYTE)(h >> 8); r[8] = (UBYTE)h;
+    send_all(r, sizeof(r));
+}
+
+/* ---- text-response helper (UITREE / MENUS / SCREENS) --------------------- */
+
+#define TEXTBUF_SIZE 16384
+static char  g_text[TEXTBUF_SIZE];
+static LONG  g_textlen;
+
+static void tclear(void) { g_textlen = 0; }
+
+static void tputs(const char *s)
+{
+    while (*s && g_textlen < TEXTBUF_SIZE - 1) g_text[g_textlen++] = *s++;
+}
+
+static void tputnum(LONG v)
+{
+    char tmp[12]; int i = 0, j;
+    if (v < 0) { if (g_textlen < TEXTBUF_SIZE - 1) g_text[g_textlen++] = '-'; v = -v; }
+    if (v == 0) tmp[i++] = '0';
+    while (v > 0) { tmp[i++] = (char)('0' + (v % 10)); v /= 10; }
+    for (j = i - 1; j >= 0 && g_textlen < TEXTBUF_SIZE - 1; j--) g_text[g_textlen++] = tmp[j];
+}
+
+/* quoted, with embedded quotes/newlines neutralised so the host can parse
+ * one record per line safely */
+static void tputq(const char *s)
+{
+    if (g_textlen < TEXTBUF_SIZE - 1) g_text[g_textlen++] = '"';
+    if (s) {
+        while (*s && g_textlen < TEXTBUF_SIZE - 2) {
+            char c = *s++;
+            if (c == '"' || c == '\\') c = '\'';
+            else if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+            g_text[g_textlen++] = c;
+        }
+    }
+    if (g_textlen < TEXTBUF_SIZE - 1) g_text[g_textlen++] = '"';
+}
+
+static void send_text(void)
+{
+    UBYTE hdr[5];
+    hdr[0] = RESP_TEXT;
+    hdr[1] = (UBYTE)(g_textlen >> 24); hdr[2] = (UBYTE)(g_textlen >> 16);
+    hdr[3] = (UBYTE)(g_textlen >>  8); hdr[4] = (UBYTE)g_textlen;
+    if (send_all(hdr, sizeof(hdr)))
+        send_all((const UBYTE *)g_text, g_textlen);
+}
+
+/* ---- semantic UI tree ----------------------------------------------------
+ * Emitted as one record per line so the host can parse it without a parser:
+ *   S <w> <h> <depth> "<screen title>"
+ *   W <idx> <left> <top> <w> <h> "<window title>"
+ *   G <id> <KIND> <left> <top> <w> <h> "<label>" "<contents>"
+ * Gadget coords are SCREEN-absolute (window origin added, REL* flags resolved)
+ * so the host can click them directly. */
+
+static const char *gadget_kind(struct Gadget *g)
+{
+    switch (g->GadgetType & GTYP_GTYPEMASK) {
+        case GTYP_BOOLGADGET:   return "BOOL";
+        case GTYP_STRGADGET:    return "STRING";
+        case GTYP_PROPGADGET:   return "PROP";
+        case GTYP_CUSTOMGADGET: return "CUSTOM";
+        default:                return "GADGET";
+    }
+}
+
+/* Append one raw C string to the quoted label being built. */
+static void tput_label_chars(const char *s)
+{
+    if (!s) return;
+    while (*s && g_textlen < TEXTBUF_SIZE - 2) {
+        char c = *s++;
+        if (c == '"' || c == '\\') c = '\'';
+        else if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        g_text[g_textlen++] = c;
+    }
+}
+
+/* A gadget's label.  gg_GadgetText is NOT always an IntuiText: GFLG_LABELMASK
+ * says which of three things it points at.  Reading a GFLG_LABELSTRING gadget
+ * as an IntuiText yields an empty (or garbage) label — that's why Time
+ * Prefs' Save/Use/Cancel buttons came back "" before this was handled. */
+static void tput_gadget_label(struct Gadget *g)
+{
+    UWORD kind = (UWORD)(g->Flags & GFLG_LABELMASK);
+
+    if (g_textlen < TEXTBUF_SIZE - 1) g_text[g_textlen++] = '"';
+
+    if (kind == GFLG_LABELSTRING) {
+        tput_label_chars((const char *)g->GadgetText);
+    } else if (kind == GFLG_LABELITEXT) {
+        struct IntuiText *it = (struct IntuiText *)g->GadgetText;
+        while (it && g_textlen < TEXTBUF_SIZE - 2) {
+            tput_label_chars((const char *)it->IText);
+            it = it->NextText;
+            if (it && g_textlen < TEXTBUF_SIZE - 2) g_text[g_textlen++] = ' ';
+        }
+    }
+    /* GFLG_LABELIMAGE: an Image, no text to report — leave it empty. */
+
+    if (g_textlen < TEXTBUF_SIZE - 1) g_text[g_textlen++] = '"';
+}
+
+static void do_uitree(void)
+{
+    struct Screen *scr = front_screen();
+    struct Window *win;
+    WORD widx = 0;
+
+    tclear();
+    if (!scr) { tputs("! no screen\n"); send_text(); return; }
+
+    tputs("S "); tputnum(scr->Width); tputs(" "); tputnum(scr->Height);
+    tputs(" "); tputnum((LONG)GetBitMapAttr(scr->RastPort.BitMap, BMA_DEPTH));
+    tputs(" "); tputq((const char *)scr->Title); tputs("\n");
+
+    for (win = scr->FirstWindow; win; win = win->NextWindow, widx++) {
+        struct Gadget *g;
+        tputs("W "); tputnum(widx);
+        tputs(" "); tputnum(win->LeftEdge); tputs(" "); tputnum(win->TopEdge);
+        tputs(" "); tputnum(win->Width);    tputs(" "); tputnum(win->Height);
+        tputs(" "); tputq((const char *)win->Title); tputs("\n");
+
+        for (g = win->FirstGadget; g; g = g->NextGadget) {
+            /* resolve the REL* flags against the window's current size */
+            WORD gl = g->LeftEdge, gt = g->TopEdge, gw = g->Width, gh = g->Height;
+            if (g->Flags & GFLG_RELRIGHT)  gl += win->Width  - 1;
+            if (g->Flags & GFLG_RELBOTTOM) gt += win->Height - 1;
+            if (g->Flags & GFLG_RELWIDTH)  gw += win->Width;
+            if (g->Flags & GFLG_RELHEIGHT) gh += win->Height;
+
+            tputs("G "); tputnum(g->GadgetID);
+            tputs(" "); tputs(gadget_kind(g));
+            tputs(" "); tputnum(win->LeftEdge + gl);
+            tputs(" "); tputnum(win->TopEdge  + gt);
+            tputs(" "); tputnum(gw); tputs(" "); tputnum(gh);
+            tputs(" "); tput_gadget_label(g);
+            tputs(" ");
+            if ((g->GadgetType & GTYP_GTYPEMASK) == GTYP_STRGADGET && g->SpecialInfo)
+                tputq((const char *)((struct StringInfo *)g->SpecialInfo)->Buffer);
+            else
+                tputq("");
+            tputs("\n");
+        }
+    }
+    send_text();
+}
+
+/* Menu strip of the frontmost window that has one:
+ *   M <menunum> "<menu title>"
+ *   I <menunum> <itemnum> "<item text>" "<shortcut>"  */
+static void do_menus(void)
+{
+    struct Screen *scr = front_screen();
+    struct Window *win;
+    struct Menu   *menu = NULL;
+    WORD mnum = 0;
+
+    tclear();
+    if (scr)
+        for (win = scr->FirstWindow; win; win = win->NextWindow)
+            if (win->MenuStrip) { menu = win->MenuStrip; break; }
+
+    if (!menu) { tputs("! no menu strip\n"); send_text(); return; }
+
+    for (; menu; menu = menu->NextMenu, mnum++) {
+        struct MenuItem *item;
+        WORD inum = 0;
+        tputs("M "); tputnum(mnum); tputs(" ");
+        tputq((const char *)menu->MenuName); tputs("\n");
+        for (item = menu->FirstItem; item; item = item->NextItem, inum++) {
+            char sc[2];
+            tputs("I "); tputnum(mnum); tputs(" "); tputnum(inum); tputs(" ");
+            /* text items carry an IntuiText in ItemFill */
+            if (!(item->Flags & ITEMTEXT) || !item->ItemFill) tputq("");
+            else tputq((const char *)((struct IntuiText *)item->ItemFill)->IText);
+            tputs(" ");
+            if (item->Flags & COMMSEQ) { sc[0] = item->Command; sc[1] = 0; tputq(sc); }
+            else tputq("");
+            tputs("\n");
+        }
+    }
+    send_text();
+}
+
+/* Open screens, front to back:  SC <idx> <w> <h> <depth> "<title>" */
+static void do_screens(void)
+{
+    struct Screen *s;
+    WORD i = 0;
+    tclear();
+    for (s = IntuitionBase->FirstScreen; s; s = s->NextScreen, i++) {
+        tputs("SC "); tputnum(i);
+        tputs(" "); tputnum(s->Width); tputs(" "); tputnum(s->Height);
+        tputs(" "); tputnum((LONG)GetBitMapAttr(s->RastPort.BitMap, BMA_DEPTH));
+        tputs(" "); tputq((const char *)s->Title); tputs("\n");
+    }
+    send_text();
+}
+
+/* ---- region checksum -----------------------------------------------------
+ * "Has it finished redrawing?" in four bytes, instead of hauling a whole
+ * frame across the wire (or guessing a fixed settle delay). */
+static void do_region_sum(WORD x, WORD y, WORD w, WORD h)
+{
+    struct Screen *scr = front_screen();
+    UBYTE  r[5];
+    ULONG  sum = 2166136261UL;             /* FNV-1a seed */
+    UBYTE *row = NULL;
+    struct RastPort trp;
+    struct BitMap  *tmpbm = NULL;
+
+    if (scr && w > 0 && h > 0) {
+        ULONG depth  = GetBitMapAttr(scr->RastPort.BitMap, BMA_DEPTH);
+        UWORD stride = (UWORD)((w + 15) & ~15);
+        if (depth > 8) {
+            /* truecolour: checksum RGB rows straight from cybergraphics */
+            if (!CyberGfxBase)
+                CyberGfxBase = OpenLibrary((STRPTR)"cybergraphics.library", 40);
+            if (CyberGfxBase) {
+                row = AllocVec((ULONG)w * 3, MEMF_PUBLIC);
+                if (row) {
+                    WORD yy; ULONG i;
+                    for (yy = 0; yy < h; yy++) {
+                        ReadPixelArray(row, 0, 0, (UWORD)(w * 3),
+                                       &scr->RastPort, x, y + yy, w, 1, RECTFMT_RGB);
+                        for (i = 0; i < (ULONG)w * 3; i++)
+                            { sum ^= row[i]; sum *= 16777619UL; }
+                    }
+                    FreeVec(row);
+                }
+            }
+        } else {
+            row   = AllocVec((ULONG)stride, MEMF_PUBLIC);
+            tmpbm = AllocBitMap(stride, 1, depth, 0, scr->RastPort.BitMap);
+            if (row && tmpbm) {
+                WORD yy; ULONG i;
+                trp = scr->RastPort; trp.Layer = NULL; trp.BitMap = tmpbm;
+                for (yy = 0; yy < h; yy++) {
+                    ReadPixelArray8(&scr->RastPort, x, y + yy, x + w - 1, y + yy, row, &trp);
+                    for (i = 0; i < (ULONG)w; i++)
+                        { sum ^= row[i]; sum *= 16777619UL; }
+                }
+            }
+            if (tmpbm) FreeBitMap(tmpbm);
+            if (row)   FreeVec(row);
+        }
+    }
+    r[0] = RESP_SUM;
+    r[1] = (UBYTE)(sum >> 24); r[2] = (UBYTE)(sum >> 16);
+    r[3] = (UBYTE)(sum >>  8); r[4] = (UBYTE)sum;
+    send_all(r, sizeof(r));
+}
+
+/* ---- file transfer -------------------------------------------------------
+ * Lets the controller deploy a freshly built binary straight onto the Amiga
+ * with no file share in the middle. */
+static void send_file_status(LONG status)
+{
+    UBYTE hdr[9];
+    hdr[0] = RESP_FILE;
+    hdr[1] = (UBYTE)(status >> 24); hdr[2] = (UBYTE)(status >> 16);
+    hdr[3] = (UBYTE)(status >>  8); hdr[4] = (UBYTE)status;
+    hdr[5] = hdr[6] = hdr[7] = hdr[8] = 0;
+    send_all(hdr, sizeof(hdr));
+}
+
+static void do_getfile(const UBYTE *p, UWORD plen)
+{
+    char  path[256];
+    BPTR  fh;
+    LONG  len;
+    UBYTE hdr[9], iobuf[1024];
+
+    if (plen > 255) plen = 255;
+    memcpy(path, p, plen); path[plen] = 0;
+
+    fh = Open((STRPTR)path, MODE_OLDFILE);
+    if (!fh) { send_file_status(-1); return; }
+    Seek(fh, 0, OFFSET_END);
+    len = Seek(fh, 0, OFFSET_BEGINNING);
+    if (len < 0) len = 0;
+
+    hdr[0] = RESP_FILE;
+    hdr[1] = hdr[2] = hdr[3] = hdr[4] = 0;          /* status 0 = ok */
+    hdr[5] = (UBYTE)(len >> 24); hdr[6] = (UBYTE)(len >> 16);
+    hdr[7] = (UBYTE)(len >>  8); hdr[8] = (UBYTE)len;
+    if (send_all(hdr, sizeof(hdr))) {
+        LONG left = len;
+        while (left > 0) {
+            LONG want = (left > (LONG)sizeof(iobuf)) ? (LONG)sizeof(iobuf) : left;
+            LONG n = Read(fh, iobuf, want);
+            if (n <= 0) break;
+            if (!send_all(iobuf, n)) break;
+            left -= n;
+        }
+    }
+    Close(fh);
+}
+
+/* A file is far bigger than the 1 KB command buffer, so PUTFILE STREAMS: the
+ * caller hands over whatever data already arrived in the buffer, and we pull
+ * the remainder straight off the socket. */
+static void do_putfile(const UBYTE *p, UWORD plen,
+                       const UBYTE *have, ULONG havelen, ULONG dlen)
+{
+    char  path[256];
+    BPTR  fh;
+    ULONG left;
+    UBYTE iobuf[1024];
+    BOOL  ok = TRUE;
+
+    if (plen > 255) plen = 255;
+    memcpy(path, p, plen); path[plen] = 0;
+
+    fh = Open((STRPTR)path, MODE_NEWFILE);
+    if (!fh) {
+        /* still have to drain the payload or the stream desyncs */
+        left = dlen - havelen;
+        while (left > 0) {
+            LONG want = (left > sizeof(iobuf)) ? (LONG)sizeof(iobuf) : (LONG)left;
+            LONG n = recv(g_client, (APTR)iobuf, want, 0);
+            if (n <= 0) break;
+            left -= n;
+        }
+        send_file_status(-1);
+        return;
+    }
+
+    if (havelen && Write(fh, (APTR)have, (LONG)havelen) != (LONG)havelen) ok = FALSE;
+
+    left = dlen - havelen;
+    while (left > 0) {
+        LONG want = (left > sizeof(iobuf)) ? (LONG)sizeof(iobuf) : (LONG)left;
+        LONG n = recv(g_client, (APTR)iobuf, want, 0);
+        if (n <= 0) { ok = FALSE; break; }
+        if (Write(fh, iobuf, n) != n) { ok = FALSE; break; }
+        left -= n;
+    }
+    Close(fh);
+    send_file_status(ok ? 0 : -2);
 }
 
 /* ---- flush filesystems before a reset --------------------------------------
@@ -485,8 +919,54 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
             send_ack();
             return 1;
         case CMD_SCREENSHOT:
-            do_screenshot();
+            do_screenshot_region(0, 0, 0, 0);   /* 0 w/h = whole screen */
             return 1;
+        case CMD_SHOT_REGION:
+            if (avail < 9) return 0;
+            do_screenshot_region((WORD)((b[1] << 8) | b[2]), (WORD)((b[3] << 8) | b[4]),
+                                 (WORD)((b[5] << 8) | b[6]), (WORD)((b[7] << 8) | b[8]));
+            return 9;
+        case CMD_POINTER:
+            do_pointer();
+            return 1;
+        case CMD_UITREE:
+            do_uitree();
+            return 1;
+        case CMD_MENUS:
+            do_menus();
+            return 1;
+        case CMD_SCREENS:
+            do_screens();
+            return 1;
+        case CMD_REGION_SUM:
+            if (avail < 9) return 0;
+            do_region_sum((WORD)((b[1] << 8) | b[2]), (WORD)((b[3] << 8) | b[4]),
+                          (WORD)((b[5] << 8) | b[6]), (WORD)((b[7] << 8) | b[8]));
+            return 9;
+        case CMD_GETFILE:
+            if (avail < 3) return 0;
+            {
+                UWORD plen = (UWORD)((b[1] << 8) | b[2]);
+                if (avail < (WORD)(3 + plen)) return 0;
+                do_getfile(b + 3, plen);
+                return (WORD)(3 + plen);
+            }
+        case CMD_PUTFILE:
+            if (avail < 3) return 0;
+            {
+                UWORD plen = (UWORD)((b[1] << 8) | b[2]);
+                ULONG dlen, have;
+                WORD  hdrlen;
+                if (avail < (WORD)(3 + plen + 4)) return 0;
+                hdrlen = (WORD)(3 + plen + 4);
+                dlen = ((ULONG)b[3 + plen] << 24) | ((ULONG)b[4 + plen] << 16) |
+                       ((ULONG)b[5 + plen] << 8)  |  (ULONG)b[6 + plen];
+                /* hand over what's buffered; do_putfile pulls the rest itself */
+                have = (ULONG)(avail - hdrlen);
+                if (have > dlen) have = dlen;
+                do_putfile(b + 3, plen, b + hdrlen, have, dlen);
+                return (WORD)(hdrlen + have);
+            }
         case CMD_REBOOT:
             flush_all_filesystems();   /* MUST precede ColdReboot - see below */
             ColdReboot();
@@ -516,7 +996,8 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
 #define BRINGUP_RETRY_ATTEMPTS 30
 #define BRINGUP_RETRY_DELAY    100     /* Delay() ticks: 2s */
 
-static LONG g_listen = -1;
+static LONG  g_listen = -1;
+static UWORD g_port   = LISTEN_PORT;   /* overridable: `netharness 7801` */
 
 static BOOL server_up(void)
 {
@@ -541,8 +1022,8 @@ static BOOL server_up(void)
      * addr(4), big-endian throughout on 68k; addr 0 = INADDR_ANY. */
     for (i = 0; i < 16; i++) sabuf[i] = 0;
     sabuf[1] = AF_INET;
-    sabuf[2] = (UBYTE)(LISTEN_PORT >> 8);
-    sabuf[3] = (UBYTE)LISTEN_PORT;
+    sabuf[2] = (UBYTE)(g_port >> 8);
+    sabuf[3] = (UBYTE)g_port;
 
     if (bind(g_listen, (struct sockaddr *)sabuf, 16) < 0 ||
         listen(g_listen, 1) < 0) {
@@ -555,12 +1036,22 @@ static BOOL server_up(void)
 
 /* ---- main ----------------------------------------------------------------- */
 
-int main(void)
+int main(int argc, char **argv)
 {
     UBYTE readbuf[512];
     LONG  n;
     int   i;
     LONG  old_priority;
+
+    /* Optional port argument. Running a NEW build on a spare port next to the
+     * live one is the safe way to test changes: never hot-swap the harness
+     * that is currently carrying your only remote control. */
+    if (argc > 1 && argv[1]) {
+        UWORD p = 0;
+        const char *s = argv[1];
+        while (*s >= '0' && *s <= '9') p = (UWORD)(p * 10 + (*s++ - '0'));
+        if (p) g_port = p;
+    }
 
     /* Modest boost: stay responsive above busy apps, but EXEC children are
      * explicitly started at 0 so they can't be starved by us either. */
@@ -592,12 +1083,12 @@ int main(void)
         Delay(BRINGUP_RETRY_DELAY);
     }
     if (g_listen < 0) {
-        printf("netharness: could not bind TCP port %d (stack down?)\n", LISTEN_PORT);
+        printf("netharness: could not bind TCP port %d (stack down?)\n", (int)g_port);
         nh_log("bind/listen failed after retries, errno", SocketBase ? Errno() : -1);
         goto cleanup_input;
     }
-    printf("netharness: listening on port %d\n", LISTEN_PORT);
-    nh_log("listening on port", LISTEN_PORT);
+    printf("netharness: listening on port %d\n", (int)g_port);
+    nh_log("netharness " NH_VERSION " listening on port", (LONG)g_port);
 
     for (;;) {
         UBYTE peer[16];

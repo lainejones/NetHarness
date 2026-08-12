@@ -33,6 +33,38 @@ Input is injected through `input.device` (`IND_WRITEEVENT`), the same path real
 hardware uses, so it exercises window activation, GadTools, menus — everything
 a genuine click would.
 
+### New in 1.3 — stop guessing pixels
+
+| Command | |
+|---|---|
+| `UITREE` | The front screen's windows and gadgets: id, kind, bounds, label, string contents |
+| `UICLICK <text>` / `UICLICKID <id>` | Click a gadget **by identity**, not coordinates |
+| `MENUS` / `MENUSEL <menu> <item>` | Enumerate the menu strip; pick an item **by name** |
+| `POINTER` | Where the pointer actually is (it's a hardware sprite — invisible in screenshots) |
+| `SHOTREGION x y w h` | Capture just a region — far cheaper than a full frame |
+| `REGIONSUM x y w h` | 4-byte checksum: "has this redrawn yet?" |
+| `WAITCHANGE x y w h` | Block until a region actually changes, instead of guessing a delay |
+| `GETFILE` / `PUTFILE` | Binary-safe file transfer — deploy a build through the harness itself |
+| `SCREENS` | List open screens, front to back |
+| `netharness [port]` | Listen port is an argument, so a new build can be tested beside the running one |
+
+`UITREE` + `UICLICK` are the headline: drive the GUI by *what things are*.
+
+```
+$ nhctl.py UITREE
+W 0 0 11 332 199 "Time Preferences"
+G 16 STRING 58 29 44 8 "" "2026"
+G 15 GADGET 128 146 192 10 "Hours" ""
+```
+
+**Honest limitation:** some gadgets expose no text to Intuition — OS 3.2 Prefs'
+Save/Use/Cancel buttons report empty labels because those apps draw the text
+themselves. Slider labels and string-gadget contents do come through. Use
+`UICLICKID <id>` for such buttons, `UICLICK <text>` everywhere else.
+
+Every input command is acknowledged **after injection**, so `OK` means the
+Amiga really did it — not merely that a packet was sent.
+
 ## Why EXEC matters
 
 Driving a GUI blind is miserable: you guess coordinates, click, screenshot,
@@ -107,6 +139,15 @@ not by looking for the cursor.
 - There is **no authentication**. It executes commands as sent — use it on a
   network you trust, not a public one.
 
+## Which version is installed?
+
+The binary carries a standard AmigaDOS version cookie:
+
+```
+$ nhctl.py --host <ip> EXEC "version C:netharness full"
+netharness 1.3 (08/11/26)
+```
+
 ## Building
 
 ```
@@ -114,7 +155,8 @@ cd amiga && make        # needs the bebbo amiga-gcc cross-compiler
 ```
 
 The Amiga side is a single C file using only standard `bsdsocket.library`
-calls, built `-m68020`.
+calls, built `-m68020` — change that to `-m68000` in `amiga/Makefile` if you
+need it to run on a stock 68000 machine.
 
 ## Licence
 
