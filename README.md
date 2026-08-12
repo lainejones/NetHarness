@@ -48,6 +48,12 @@ a genuine click would.
 | `SCREENS` | List open screens, front to back |
 | `netharness [port]` | Listen port is an argument, so a new build can be tested beside the running one |
 
+**New in 1.4:**
+
+| Command | |
+|---|---|
+| `RELOAD` | Apply a staged `C:netharness.new` and **restart the harness in place - no machine reboot** |
+
 `UITREE` + `UICLICK` are the headline: drive the GUI by *what things are*.
 
 ```
@@ -128,6 +134,13 @@ not by looking for the cursor.
 - **Every input command is acknowledged** by the Amiga after injection, so
   `OK` means *delivered and injected*, not merely *sent*. Without that, a
   command that lands on nothing looks exactly like one that worked.
+- **Prefer `RELOAD` over `REBOOT` for updates.** `REBOOT` calls `ColdReboot()`,
+  and not every machine survives a warm CPU reset - one of the test machines
+  here (an A2000 with a GVP controller) lands on a grey screen and needs a
+  power cycle. `RELOAD` applies a staged `C:netharness.new` and restarts the
+  harness in place instead, which is what rebooting was being used for anyway.
+  It applies the update *while still serving*, so a failed copy leaves the
+  working build running rather than bricking your remote access.
 - **`REBOOT` flushes filesystems first.** `ColdReboot()` resets instantly, and
   without an explicit flush any file written moments earlier is quietly lost —
   which looks uncannily like the file "reverting" after a reboot.
@@ -145,7 +158,7 @@ The binary carries a standard AmigaDOS version cookie:
 
 ```
 $ nhctl.py --host <ip> EXEC "version C:netharness full"
-netharness 1.3 (08/11/26)
+netharness 1.4 (08/12/26)
 ```
 
 ## Building

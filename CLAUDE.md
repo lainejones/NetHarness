@@ -111,6 +111,31 @@ The startup line in `T:netharness.log` carries it too, which tells you what is
 actually *running* rather than what is on disk. **Bump `NH_VERSION` whenever the
 wire protocol or command set changes.**
 
+### ⚠ `REBOOT` GREY-SCREENS THE A2000 — use `RELOAD` (v1.4+)
+`CMD_REBOOT` calls `ColdReboot()`, and **the A2000 does not survive a warm CPU
+reset**: it lands on a grey screen and needs a **power cycle**. (Classic on
+boxes whose accelerator/SCSI controller does not reinitialise on reset — this
+one has a GVP.) This was the "unexplained A2000 crash" chased for hours; the
+binary was never at fault, the reboot was.
+
+**v1.4 adds `RELOAD`, which makes rebooting unnecessary for the only thing it
+was used for — swapping the binary:**
+```
+nhctl.py --host <ip> PUTFILE <newbuild> C:netharness.new
+nhctl.py --host <ip> RELOAD          # applies it and restarts in place, ~10s
+```
+It applies the staged `.new` **while still serving** (so a failed copy leaves
+the old build running and answers `REFUSED`), frees the port, launches the
+replacement and exits. Verified on the A4000: 1.3 → 1.4 with no reboot.
+- **Only `REBOOT` on the A4000.** On the A2000, if a real reboot is needed, ask
+  for a power cycle.
+- A pre-1.4 harness has no RELOAD, so the first 1.4 install on a machine still
+  needs a boot — on the A2000 that means a power cycle, so just stage
+  `C:netharness.new` and let its next natural power-up pick it up.
+- **A stray harness is now killable**: it checks `SIGBREAKF_CTRL_C` each time
+  round the accept loop, so `break <n>` (from `status`) stops it. Pre-1.4 ones
+  sit in `accept()`/`Delay()` and ignore breaks — those need a boot.
+
 ### Safe update procedure (do NOT skip the spare port)
 The harness takes an optional port argument, so a new build can be proven while
 the live one keeps serving:

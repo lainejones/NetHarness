@@ -35,6 +35,10 @@
  *     CMD_SHOT_REGION  = 15  payload: x2 y2 w2 h2     (partial screenshot)
  *     CMD_GETFILE      = 16  payload: len2 path[len]
  *     CMD_PUTFILE      = 17  payload: plen2 path[plen] dlen4 data[dlen]
+ *     CMD_RELOAD       = 18  payload: none  (apply a staged
+ *       C:netharness.new and restart IN PLACE - no machine reboot;
+ *       ColdReboot() greyscreens some machines. Replies ACK+1 on
+ *       handoff, ACK+0 if the update could not be applied.)
  *
  *   Amiga -> host:
  *     RESP_SCREENSHOT_HDR = 0x81  payload: width2 height2 depth1 bpr2, then
@@ -72,6 +76,7 @@
 #include <intuition/intuition.h>
 #include <intuition/screens.h>
 #include <graphics/gfx.h>
+#include <dos/dos.h>
 #include <dos/dostags.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
@@ -93,8 +98,8 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.3"
-#define NH_VERDATE "11.08.2026"
+#define NH_VERSION "1.4"
+#define NH_VERDATE "12.08.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
 
@@ -115,6 +120,7 @@ static const char verstag[] __attribute__((used)) =
 #define CMD_SHOT_REGION  15
 #define CMD_GETFILE      16
 #define CMD_PUTFILE      17
+#define CMD_RELOAD       18
 
 #define RESP_SCREENSHOT_HDR 0x81
 #define RESP_ACK            0x82
@@ -123,6 +129,10 @@ static const char verstag[] __attribute__((used)) =
 #define RESP_TEXT           0x85
 #define RESP_FILE           0x86
 #define RESP_SUM            0x87
+
+/* Where the installed harness lives; RELOAD applies <BINARY_PATH>.new here,
+ * matching what C:nhboot does at boot. */
+#define BINARY_PATH    "C:netharness"
 
 #define EXEC_CMD_MAX   512          /* max AmigaDOS command line we accept */
 #define EXEC_OUT_FILE  "T:netharness.out"
@@ -148,6 +158,7 @@ static struct MsgPort  *inputmp;
 static struct IOStdReq *inputio;
 
 static LONG g_client = -1;          /* accepted client socket, -1 = none */
+static LONG g_listen = -1;          /* listening socket (RELOAD frees it) */
 
 /* ---- TCP helpers ------------------------------------------------------- */
 
@@ -878,6 +889,77 @@ static void flush_all_filesystems(void)
     Delay(25);   /* 0.5s: let drivers push their own write caches out */
 }
 
+/* ---- RELOAD: restart the harness in place, WITHOUT rebooting the machine ---
+ * `REBOOT` calls ColdReboot(), and some machines do not survive a warm CPU
+ * reset: the A2000 here lands on a grey screen and needs a power cycle (a
+ * classic symptom on boxes whose accelerator/SCSI controller does not
+ * reinitialise on reset). Rebooting merely to swap a binary was always
+ * heavy-handed anyway, so RELOAD does the same job in place:
+ *   1. apply a staged C:netharness.new (exactly what C:nhboot does at boot)
+ *      WHILE STILL SERVING, so a failed copy leaves us alive to report it,
+ *   2. free the listening port,
+ *   3. launch the replacement and exit.
+ * The incoming instance retries bind for 60s, which covers the handover, and
+ * SO_REUSEADDR is already set. */
+
+static BOOL g_reload = FALSE;
+
+static BOOL file_exists(const char *path)
+{
+    BPTR l = Lock((STRPTR)path, ACCESS_READ);
+    if (!l) return FALSE;
+    UnLock(l);
+    return TRUE;
+}
+
+/* Run a DOS command synchronously with output discarded; returns its rc. */
+static LONG run_quiet(const char *cmd)
+{
+    BPTR in, out;
+    LONG rc;
+    in  = Open((STRPTR)"NIL:", MODE_OLDFILE);
+    out = Open((STRPTR)"NIL:", MODE_NEWFILE);
+    rc = SystemTags((STRPTR)cmd,
+                    SYS_Input,    (Tag)in,
+                    SYS_Output,   (Tag)out,
+                    NP_WindowPtr, (Tag)-1L,
+                    TAG_DONE);
+    /* this dos.library does not close SYS_Input/SYS_Output for us */
+    if (out) Close(out);
+    if (in)  Close(in);
+    return rc;
+}
+
+static void do_reload(void)
+{
+    UBYTE hdr[2];
+
+    /* 1. apply a staged update while we are still able to answer. */
+    if (file_exists(BINARY_PATH ".new")) {
+        if (run_quiet("C:Copy " BINARY_PATH ".new " BINARY_PATH " CLONE") != 0) {
+            nh_log("reload: copy of .new FAILED, staying on the old build", 0);
+            hdr[0] = RESP_ACK; hdr[1] = 0;      /* 0 = refused, still running */
+            send_all(hdr, 2);
+            return;
+        }
+        run_quiet("C:Delete " BINARY_PATH ".new QUIET");
+        run_quiet("C:Protect " BINARY_PATH " +e");
+        nh_log("reload: applied staged update", 0);
+    }
+
+    hdr[0] = RESP_ACK; hdr[1] = 1;              /* 1 = reloading now */
+    send_all(hdr, 2);
+
+    /* 2. free the port before the replacement tries to bind. */
+    if (g_client >= 0) { CloseSocket(g_client); g_client = -1; }
+    if (g_listen >= 0) { CloseSocket(g_listen); g_listen = -1; }
+
+    /* 3. hand off. `run` returns immediately, so this does not block us. */
+    run_quiet("run >NIL: " BINARY_PATH);
+    nh_log("reload: handed off, exiting", 0);
+    g_reload = TRUE;
+}
+
 /* ---- command stream reassembly -------------------------------------------
  * TCP is a byte stream: commands can arrive split across, or several per,
  * recv().  Accumulate and parse out complete commands - same pattern (and
@@ -982,6 +1064,9 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
         case CMD_PING:
             send_ack();
             return 1;
+        case CMD_RELOAD:
+            do_reload();
+            return 1;
         default:
             /* Unknown byte: drop and resync rather than jam the stream. */
             return 1;
@@ -996,7 +1081,6 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
 #define BRINGUP_RETRY_ATTEMPTS 30
 #define BRINGUP_RETRY_DELAY    100     /* Delay() ticks: 2s */
 
-static LONG  g_listen = -1;
 static UWORD g_port   = LISTEN_PORT;   /* overridable: `netharness 7801` */
 
 static BOOL server_up(void)
@@ -1097,9 +1181,18 @@ int main(int argc, char **argv)
          * accept(s,NULL,NULL) but a real stack may EFAULT on it.  And on ANY
          * accept failure, sleep before retrying — a tight retry loop at our
          * boosted priority would busy-lock the whole machine. */
+        if (g_reload) break;          /* handed off: do not accept() a closed fd */
+        /* A stray instance used to be unkillable: blocked in accept()/Delay()
+         * it never noticed a Shell `break`, so it had to be rebooted away.
+         * Check the break signal on every pass round the accept loop. */
+        if (CheckSignal(SIGBREAKF_CTRL_C)) {
+            nh_log("CTRL-C: exiting", 0);
+            break;
+        }
         g_client = accept(g_listen, (struct sockaddr *)peer, &peerlen);
         if (g_client < 0) {
             nh_log("accept failed, errno", Errno());
+            if (CheckSignal(SIGBREAKF_CTRL_C)) { nh_log("CTRL-C: exiting", 0); break; }
             Delay(50);   /* 1s */
             continue;
         }
@@ -1109,6 +1202,7 @@ int main(int argc, char **argv)
         for (;;) {
             n = recv(g_client, (APTR)readbuf, sizeof(readbuf), 0);
             if (n <= 0) break;    /* client gone */
+            if (g_reload) break;  /* handed off to the replacement */
 
             if (cmdbuf_len + n > CMDBUF_SIZE) {
                 cmdbuf_len = 0;   /* never overrun; resync */
@@ -1132,8 +1226,9 @@ int main(int argc, char **argv)
             }
         }
 
-        CloseSocket(g_client);
+        if (g_client >= 0) CloseSocket(g_client);
         g_client = -1;
+        if (g_reload) break;          /* replacement is taking over; exit */
         /* loop back to accept() for the next controller connection */
     }
 

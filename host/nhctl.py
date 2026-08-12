@@ -36,6 +36,8 @@ v1.3 - stop guessing pixels:
   WAITCHANGE x y w h [secs] block until that region's checksum changes
   GETFILE <amiga> <local>   copy a file off the Amiga
   PUTFILE <local> <amiga>   copy a file onto the Amiga (deploy a binary!)
+  RELOAD                    apply C:netharness.new + restart in place
+                            (no reboot; REBOOT greyscreens some machines)
 
 Every input command waits for the Amiga's RESP_ACK, so "OK" here means
 DELIVERED AND INJECTED (the fix for the A1200 harness's biggest blind spot).
@@ -57,6 +59,7 @@ CMD_MOUSE_MOVE, CMD_MOUSE_BUTTON, CMD_KEY, CMD_HOME_MOUSE = 1, 2, 3, 4
 CMD_SCREENSHOT, CMD_REBOOT, CMD_RESET_INPUT, CMD_EXEC, CMD_PING = 5, 6, 7, 8, 9
 CMD_POINTER, CMD_UITREE, CMD_MENUS, CMD_SCREENS = 10, 11, 12, 13
 CMD_REGION_SUM, CMD_SHOT_REGION, CMD_GETFILE, CMD_PUTFILE = 14, 15, 16, 17
+CMD_RELOAD = 18
 RESP_SCREENSHOT_HDR, RESP_ACK, RESP_EXEC = 0x81, 0x82, 0x83
 RESP_POINTER, RESP_TEXT, RESP_FILE, RESP_SUM = 0x84, 0x85, 0x86, 0x87
 
@@ -362,6 +365,17 @@ class NetHarness:
             f.write(data)
         return n
 
+    def reload(self):
+        """Apply a staged C:netharness.new and restart the harness IN PLACE.
+        No machine reboot - ColdReboot() leaves some machines (the A2000) on a
+        grey screen. Returns True if it handed off, False if the update could
+        not be applied (in which case the OLD harness is still running)."""
+        self.sock.sendall(bytes([CMD_RELOAD]))
+        tag = self._recv_exactly(1)
+        if not tag or tag[0] != RESP_ACK:
+            raise RuntimeError('reload: no ack')
+        return self._recv_exactly(1)[0] == 1
+
     def put_file(self, local_path, amiga_path, timeout=180):
         with open(local_path, 'rb') as f:
             data = f.read()
@@ -547,6 +561,12 @@ def run_command(nh, argv):
         return 0 if ok else 1
     elif cmd == 'GETFILE':
         n = nh.get_file(args[0], args[1]); print(f'OK got {n} bytes -> {args[1]}')
+    elif cmd == 'RELOAD':
+        if nh.reload():
+            print('OK reloading (staged update applied if present)')
+        else:
+            print('REFUSED - could not apply the staged update; old build still running')
+            return 1
     elif cmd == 'PUTFILE':
         n = nh.put_file(args[0], args[1]); print(f'OK put {n} bytes -> {args[1]}')
     elif cmd == 'EXEC':
