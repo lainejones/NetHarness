@@ -98,8 +98,8 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.5"
-#define NH_VERDATE "22.08.2026"
+#define NH_VERSION "1.6"
+#define NH_VERDATE "23.08.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
 
@@ -207,10 +207,42 @@ static WORD wait_readable(LONG sock)
 }
 
 /* send() until all bytes are out (TCP can take partial writes). */
+/* Wait until `sock` is writable or ~`secs` pass. Returns 1 = writable,
+ * 0 = timed out / shutdown. Companion to wait_readable(): a client that
+ * vanished mid-transfer (WiFi drop, killed controller) leaves its socket
+ * unwritable forever, and a blocking send() then wedges the ENTIRE harness -
+ * hit twice on 2026-08-23 (screenshot into a dead session froze remote
+ * control until the connection finally RSTed). */
+static WORD wait_writable_s(LONG sock, LONG secs)
+{
+    struct timeval tv;
+    ULONG writefds, sigs;
+    LONG  rc, waited = 0;
+
+    if (sock < 0 || sock > 31) return 1;
+    while (waited < secs) {
+        writefds    = 1UL << sock;
+        sigs        = SIGBREAKF_CTRL_C;
+        tv.tv_secs  = 1;
+        tv.tv_micro = 0;
+        rc = WaitSelect(sock + 1, NULL, &writefds, NULL, &tv, &sigs);
+        if (sigs & SIGBREAKF_CTRL_C) { g_shutdown = 1; return 0; }
+        if (rc > 0) return 1;
+        if (rc < 0) { if (CheckSignal(SIGBREAKF_CTRL_C)) { g_shutdown = 1; return 0; } }
+        waited++;
+    }
+    return 0;
+}
+
+#define SEND_STALL_SECS 20   /* unwritable this long = client is gone */
+#define CLIENT_IDLE_SECS 600 /* silent client dropped after this long */
+
 static BOOL send_all(const UBYTE *buf, LONG len)
 {
     while (len > 0) {
-        LONG n = send(g_client, (APTR)buf, len, 0);
+        LONG n;
+        if (!wait_writable_s(g_client, SEND_STALL_SECS)) return FALSE;
+        n = send(g_client, (APTR)buf, len, 0);
         if (n <= 0) return FALSE;
         buf += n;
         len -= n;
@@ -1167,7 +1199,7 @@ static BOOL server_up(void)
 int main(int argc, char **argv)
 {
     UBYTE readbuf[512];
-    LONG  n;
+    LONG  n, idle_secs = 0;
     int   i;
     LONG  old_priority;
 
@@ -1251,13 +1283,24 @@ int main(int argc, char **argv)
         nh_log("client connected, fd", g_client);
         cmdbuf_len = 0;
 
+        idle_secs = 0;
         for (;;) {
             /* Same reasoning as the accept() above: a blocking recv() would
              * hold bsdsocket open across a shutdown request. */
             {
                 WORD w = wait_readable(g_client);
                 if (w < 0) { nh_log("shutdown requested: dropping client", 0); g_shutdown = 1; break; }
-                if (w == 0) continue;   /* idle - keep waiting */
+                if (w == 0) {
+                    /* idle-client reaper: a controller that died without a
+                     * FIN (link drop) would otherwise hold this slot forever
+                     * - and the harness serves ONE client at a time */
+                    if (++idle_secs >= CLIENT_IDLE_SECS) {
+                        nh_log("client idle too long, dropping", idle_secs);
+                        break;
+                    }
+                    continue;   /* idle - keep waiting */
+                }
+                idle_secs = 0;
             }
             n = recv(g_client, (APTR)readbuf, sizeof(readbuf), 0);
             if (n <= 0) break;    /* client gone */
