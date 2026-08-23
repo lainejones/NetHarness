@@ -98,8 +98,8 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.4"
-#define NH_VERDATE "12.08.2026"
+#define NH_VERSION "1.5"
+#define NH_VERDATE "22.08.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
 
@@ -159,8 +159,52 @@ static struct IOStdReq *inputio;
 
 static LONG g_client = -1;          /* accepted client socket, -1 = none */
 static LONG g_listen = -1;          /* listening socket (RELOAD frees it) */
+static WORD g_shutdown = 0;         /* stack is going away: close up and exit */
+
+/* Note: the bsdsocket protos spell the select timeout "struct __timeval", but
+ * this NDK maps that straight onto the Amiga "struct timeval" from
+ * devices/timer.h (already included above) - do NOT redeclare it. */
 
 /* ---- TCP helpers ------------------------------------------------------- */
+
+/* Wait until `sock` is readable, a break arrives, or ~1s passes.
+ * Returns 1 = readable, 0 = nothing yet (caller should loop), -1 = shut down.
+ *
+ * WHY THIS EXISTS: Roadshow's NetShutdown signals every bsdsocket user with
+ * CTRL-C and then WAITS for them to close the library before tearing the stack
+ * down. Parked in a blocking accept()/recv() we never noticed the signal, so
+ * NetShutdown gave up with "timeout; network may shut down later" and DEFERRED
+ * its teardown - which then fired asynchronously and took the machine down with
+ * it (reset, and the SCSI bus left wedged so the GVP found no boot drive).
+ * That is the Roadie "Go Offline" crash. WaitSelect() blocks on the socket AND
+ * the signal, so a shutdown request is now noticed immediately. The 1s timeout
+ * is belt-and-braces: even if a stack ignores the signal mask we still return
+ * and re-check. */
+static WORD wait_readable(LONG sock)
+{
+    struct timeval tv;
+    ULONG readfds, sigs;
+    LONG  rc;
+
+    if (sock < 0) return -1;
+    if (sock > 31) return 1;        /* outside a one-word fd_set: just try it */
+
+    readfds     = 1UL << sock;      /* fd_set bit n = fd n, LSB first */
+    sigs        = SIGBREAKF_CTRL_C;
+    tv.tv_secs  = 1;
+    tv.tv_micro = 0;
+
+    rc = WaitSelect(sock + 1, &readfds, NULL, NULL, &tv, &sigs);
+
+    if (sigs & SIGBREAKF_CTRL_C) return -1;
+    if (rc < 0) {
+        /* EINTR or a transient error - only bail out if a break really is set */
+        if (CheckSignal(SIGBREAKF_CTRL_C)) return -1;
+        return 0;
+    }
+    if (rc == 0) return 0;          /* timed out */
+    return 1;
+}
 
 /* send() until all bytes are out (TCP can take partial writes). */
 static BOOL send_all(const UBYTE *buf, LONG len)
@@ -1189,6 +1233,14 @@ int main(int argc, char **argv)
             nh_log("CTRL-C: exiting", 0);
             break;
         }
+        /* Block on the socket AND the break signal, never on accept() alone -
+         * see wait_readable(): a blocking accept() here is what made
+         * NetShutdown time out and defer its teardown. */
+        {
+            WORD w = wait_readable(g_listen);
+            if (w < 0) { nh_log("shutdown requested: exiting", 0); g_shutdown = 1; break; }
+            if (w == 0) continue;       /* nothing pending - re-check signals */
+        }
         g_client = accept(g_listen, (struct sockaddr *)peer, &peerlen);
         if (g_client < 0) {
             nh_log("accept failed, errno", Errno());
@@ -1200,6 +1252,13 @@ int main(int argc, char **argv)
         cmdbuf_len = 0;
 
         for (;;) {
+            /* Same reasoning as the accept() above: a blocking recv() would
+             * hold bsdsocket open across a shutdown request. */
+            {
+                WORD w = wait_readable(g_client);
+                if (w < 0) { nh_log("shutdown requested: dropping client", 0); g_shutdown = 1; break; }
+                if (w == 0) continue;   /* idle - keep waiting */
+            }
             n = recv(g_client, (APTR)readbuf, sizeof(readbuf), 0);
             if (n <= 0) break;    /* client gone */
             if (g_reload) break;  /* handed off to the replacement */
@@ -1229,6 +1288,7 @@ int main(int argc, char **argv)
         if (g_client >= 0) CloseSocket(g_client);
         g_client = -1;
         if (g_reload) break;          /* replacement is taking over; exit */
+        if (g_shutdown) break;        /* stack going away; release it promptly */
         /* loop back to accept() for the next controller connection */
     }
 
@@ -1236,6 +1296,10 @@ int main(int argc, char **argv)
 cleanup_input:
     input_close();
 cleanup_libs:
+    /* Release the listening socket BEFORE the library, so a NetShutdown that is
+     * waiting on us can proceed the moment we exit. (Not on the RELOAD path -
+     * there the replacement instance inherits the fd.) */
+    if (!g_reload && g_listen >= 0) { CloseSocket(g_listen); g_listen = -1; }
     if (SocketBase)    CloseLibrary(SocketBase);
     if (GfxBase)       CloseLibrary((struct Library *)GfxBase);
     if (IntuitionBase) CloseLibrary((struct Library *)IntuitionBase);
