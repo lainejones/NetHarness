@@ -54,6 +54,21 @@ a genuine click would.
 |---|---|
 | `RELOAD` | Apply a staged `C:netharness.new` and **restart the harness in place - no machine reboot** |
 
+**New in 1.5:**
+
+- Plays fair with the TCP/IP stack's own shutdown: the harness blocks in
+  `WaitSelect` on socket **and** break signal, so a stack shutdown (Roadshow's
+  `NetShutdown`) sees it release `bsdsocket.library` immediately instead of
+  timing out against a blocked `accept()`/`recv()` and deferring the teardown.
+
+**New in 1.6:**
+
+- Send-stall guard: a controller that vanishes mid-transfer no longer freezes
+  the harness in a blocking `send()` - every send waits for writability first
+  (20 s cap), then the dead client is dropped.
+- Idle-client reaper: a silent client is disconnected after 600 s, so a
+  controller that died without closing can't hold the single client slot.
+
 `UITREE` + `UICLICK` are the headline: drive the GUI by *what things are*.
 
 ```
@@ -93,6 +108,10 @@ Run >NIL: C:netharness
 
 It listens on TCP port **7800**. To start it at every boot, add that `Run` line
 to the end of `S:User-Startup`, after your TCP/IP stack comes up.
+
+One addressing nuance: with a **proxy-style stack** such as a314bsd (where the
+sockets actually live on a Raspberry Pi), connect to the *proxy host's* IP —
+the Amiga itself has no address of its own.
 
 Use the installer rather than copying by hand, especially if you unpacked the
 **.zip**: ZIP archives cannot carry AmigaDOS protection bits, so `netharness`
@@ -136,8 +155,7 @@ not by looking for the cursor.
   command that lands on nothing looks exactly like one that worked.
 - **Prefer `RELOAD` over `REBOOT` for updates.** `REBOOT` calls `ColdReboot()`,
   and not every machine survives a warm CPU reset - one of the test machines
-  here (an A2000 with a GVP controller) lands on a grey screen and needs a
-  power cycle. `RELOAD` applies a staged `C:netharness.new` and restarts the
+  here (an A2000) lands on a grey screen and needs a power cycle. `RELOAD` applies a staged `C:netharness.new` and restarts the
   harness in place instead, which is what rebooting was being used for anyway.
   It applies the update *while still serving*, so a failed copy leaves the
   working build running rather than bricking your remote access.
