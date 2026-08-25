@@ -52,7 +52,7 @@ import struct
 import sys
 import time
 
-DEFAULT_HOST = '192.168.50.32'      # the A4000
+DEFAULT_HOST = '192.168.1.32'       # set to your Amiga's IP, or use --host
 DEFAULT_PORT = 7800
 
 CMD_MOUSE_MOVE, CMD_MOUSE_BUTTON, CMD_KEY, CMD_HOME_MOUSE = 1, 2, 3, 4
