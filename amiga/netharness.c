@@ -98,8 +98,8 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.6"
-#define NH_VERDATE "23.08.2026"
+#define NH_VERSION "1.7"
+#define NH_VERDATE "27.8.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
 
@@ -1152,10 +1152,15 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
 /* ---- TCP server bring-up -------------------------------------------------
  * Retried from scratch each round: on a cold boot this may run before
  * Roadshow's interfaces are up (OpenLibrary starts the stack, but bind can
- * still fail early).  30 x 2s covers boot ordering comfortably. */
+ * still fail early).  v1.7: retries FOREVER - 2s apart for the first minute,
+ * then every 10s - so the harness self-connects whenever the network path
+ * eventually appears (a314 Pi finishing its own boot, WiFi rejoin, stack
+ * restart) instead of giving up after 60s and needing a manual run.
+ * CTRL-C still aborts the wait. */
 
-#define BRINGUP_RETRY_ATTEMPTS 30
-#define BRINGUP_RETRY_DELAY    100     /* Delay() ticks: 2s */
+#define BRINGUP_FAST_ATTEMPTS  30
+#define BRINGUP_FAST_DELAY     100     /* Delay() ticks: 2s */
+#define BRINGUP_SLOW_DELAY     500     /* Delay() ticks: 10s */
 
 static UWORD g_port   = LISTEN_PORT;   /* overridable: `netharness 7801` */
 
@@ -1238,14 +1243,19 @@ int main(int argc, char **argv)
         goto cleanup_libs;
     }
 
-    for (i = 0; i < BRINGUP_RETRY_ATTEMPTS; i++) {
+    for (i = 0; ; i++) {
         if (server_up()) break;
-        Delay(BRINGUP_RETRY_DELAY);
-    }
-    if (g_listen < 0) {
-        printf("netharness: could not bind TCP port %d (stack down?)\n", (int)g_port);
-        nh_log("bind/listen failed after retries, errno", SocketBase ? Errno() : -1);
-        goto cleanup_input;
+        if (CheckSignal(SIGBREAKF_CTRL_C)) {
+            printf("netharness: CTRL-C while waiting for the network - exiting\n");
+            nh_log("CTRL-C during bring-up wait", 0);
+            goto cleanup_input;
+        }
+        if (i == BRINGUP_FAST_ATTEMPTS) {
+            printf("netharness: network not up yet - will keep retrying every 10s\n");
+            nh_log("bind still failing - entering slow retry, errno",
+                   SocketBase ? Errno() : -1);
+        }
+        Delay(i < BRINGUP_FAST_ATTEMPTS ? BRINGUP_FAST_DELAY : BRINGUP_SLOW_DELAY);
     }
     printf("netharness: listening on port %d\n", (int)g_port);
     nh_log("netharness " NH_VERSION " listening on port", (LONG)g_port);
