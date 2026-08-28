@@ -69,6 +69,14 @@ a genuine click would.
 - Idle-client reaper: a silent client is disconnected after 600 s, so a
   controller that died without closing can't hold the single client slot.
 
+**New in 1.7:**
+
+- Bring-up retries forever instead of giving up after 60 s: 2 s apart for the
+  first minute, then every 10 s (CTRL-C aborts the wait). The harness now
+  self-connects whenever its network path appears late - a companion Pi still
+  booting, WiFi rejoining, or the stack restarting - with no manual run needed
+  at the machine.
+
 `UITREE` + `UICLICK` are the headline: drive the GUI by *what things are*.
 
 ```
