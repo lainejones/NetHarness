@@ -98,8 +98,8 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.7"
-#define NH_VERDATE "27.8.2026"
+#define NH_VERSION "1.8"
+#define NH_VERDATE "25.9.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
 
@@ -156,6 +156,54 @@ static void nh_log(const char *msg, LONG num)
 
 static struct MsgPort  *inputmp;
 static struct IOStdReq *inputio;
+
+/* ---- client allowlist ---------------------------------------------------
+ * EXEC/PUTFILE/RELOAD/REBOOT give full control of the machine, so only the
+ * controllers listed in ENV:NetHarness.allow may connect.  Entries are
+ * separated by spaces, commas or newlines: an exact IPv4 address
+ * ("192.168.50.101"), a prefix ending in a dot ("192.168.50."), or "*" for
+ * anyone.  Loopback is always allowed.  The file is re-read on every connect,
+ * so it can be edited live (copy it to ENVARC: to survive a reboot).
+ * No file = the pre-1.8 behaviour (anyone), logged as a warning on each
+ * connect, so upgrading a machine can never lock its controller out. */
+#define ALLOW_VAR  "NetHarness.allow"
+#define ALLOW_MAX  512
+
+static BOOL peer_allowed(const UBYTE *ip)
+{
+    static char list[ALLOW_MAX];
+    char dotted[16];
+    LONG n;
+    char *p;
+
+    if (ip[0] == 127) return TRUE;
+    sprintf(dotted, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+
+    n = GetVar((STRPTR)ALLOW_VAR, (STRPTR)list, sizeof(list),
+               GVF_GLOBAL_ONLY | GVF_BINARY_VAR);
+    if (n < 0) {
+        nh_log("WARNING: no ENV:" ALLOW_VAR " - any host may connect", 0);
+        return TRUE;
+    }
+    list[n < (LONG)sizeof(list) ? n : (LONG)sizeof(list) - 1] = 0;
+
+    for (p = list; *p; ) {
+        char *tok;
+        LONG len;
+        while (*p == ' ' || *p == '\t' || *p == ',' || *p == '\n' || *p == '\r') p++;
+        tok = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != ',' && *p != '\n' && *p != '\r') p++;
+        len = (LONG)(p - tok);
+        if (len == 0) continue;
+        if (len == 1 && tok[0] == '*') return TRUE;
+        if (tok[len - 1] == '.') {
+            if (strncmp(dotted, tok, len) == 0) return TRUE;       /* prefix */
+        } else if ((LONG)strlen(dotted) == len && strncmp(dotted, tok, len) == 0) {
+            return TRUE;                                            /* exact */
+        }
+    }
+    return FALSE;
+}
 
 static LONG g_client = -1;          /* accepted client socket, -1 = none */
 static LONG g_listen = -1;          /* listening socket (RELOAD frees it) */
@@ -1045,7 +1093,12 @@ static void do_reload(void)
 static UBYTE cmdbuf[CMDBUF_SIZE];
 static WORD  cmdbuf_len = 0;
 
-/* Returns bytes consumed for one complete command, or 0 if incomplete. */
+/* Returns bytes consumed for one complete command, 0 if incomplete, or -1 for
+ * a command that can never fit in cmdbuf.  Lengths are checked as LONG: a
+ * 16-bit length near 65535 cast to WORD goes negative, which used to pass the
+ * "complete?" test and walk the parser backwards out of cmdbuf.  An oversized
+ * command drops the client - its payload would otherwise be parsed as
+ * commands once it arrived. */
 static WORD dispatch_one(const UBYTE *b, WORD avail)
 {
     switch (b[0]) {
@@ -1105,7 +1158,8 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
             if (avail < 3) return 0;
             {
                 UWORD plen = (UWORD)((b[1] << 8) | b[2]);
-                if (avail < (WORD)(3 + plen)) return 0;
+                if (3L + plen > CMDBUF_SIZE) return -1;
+                if ((LONG)avail < 3L + plen) return 0;
                 do_getfile(b + 3, plen);
                 return (WORD)(3 + plen);
             }
@@ -1115,7 +1169,8 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
                 UWORD plen = (UWORD)((b[1] << 8) | b[2]);
                 ULONG dlen, have;
                 WORD  hdrlen;
-                if (avail < (WORD)(3 + plen + 4)) return 0;
+                if (3L + plen + 4 > CMDBUF_SIZE) return -1;
+                if ((LONG)avail < 3L + plen + 4) return 0;
                 hdrlen = (WORD)(3 + plen + 4);
                 dlen = ((ULONG)b[3 + plen] << 24) | ((ULONG)b[4 + plen] << 16) |
                        ((ULONG)b[5 + plen] << 8)  |  (ULONG)b[6 + plen];
@@ -1133,7 +1188,8 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
             if (avail < 3) return 0;
             {
                 UWORD clen = (UWORD)((b[1] << 8) | b[2]);
-                if (avail < (WORD)(3 + clen)) return 0;
+                if (3L + clen > CMDBUF_SIZE) return -1;
+                if ((LONG)avail < 3L + clen) return 0;
                 do_exec(b + 3, clen);
                 return (WORD)(3 + clen);
             }
@@ -1290,6 +1346,15 @@ int main(int argc, char **argv)
             Delay(50);   /* 1s */
             continue;
         }
+        /* peer is a BSD sockaddr_in: len(1) family(1) port(2) addr(4) */
+        if (!peer_allowed(peer + 4)) {
+            nh_log("rejected client not in ENV:" ALLOW_VAR ", ip",
+                   (LONG)(((ULONG)peer[4] << 24) | ((ULONG)peer[5] << 16) |
+                          ((ULONG)peer[6] << 8) | peer[7]));
+            CloseSocket(g_client);
+            g_client = -1;
+            continue;
+        }
         nh_log("client connected, fd", g_client);
         cmdbuf_len = 0;
 
@@ -1312,23 +1377,35 @@ int main(int argc, char **argv)
                 }
                 idle_secs = 0;
             }
-            n = recv(g_client, (APTR)readbuf, sizeof(readbuf), 0);
+            /* only take what fits: the unparsed tail is always one partial
+             * command (<= CMDBUF_SIZE), so a legit stream can't overflow */
+            {
+                LONG room = CMDBUF_SIZE - cmdbuf_len;
+                if (room > (LONG)sizeof(readbuf)) room = sizeof(readbuf);
+                n = recv(g_client, (APTR)readbuf, room, 0);
+            }
             if (n <= 0) break;    /* client gone */
             if (g_reload) break;  /* handed off to the replacement */
 
             if (cmdbuf_len + n > CMDBUF_SIZE) {
-                cmdbuf_len = 0;   /* never overrun; resync */
-                continue;
+                /* every valid command fits, so this is garbage or hostile;
+                 * resyncing mid-stream could run payload bytes as commands */
+                nh_log("command buffer overflow, dropping client", cmdbuf_len + n);
+                break;
             }
             memcpy(cmdbuf + cmdbuf_len, readbuf, n);
             cmdbuf_len += (WORD)n;
 
             {
-                WORD pos = 0;
+                WORD pos = 0, consumed = 0;
                 while (pos < cmdbuf_len) {
-                    WORD consumed = dispatch_one(cmdbuf + pos, cmdbuf_len - pos);
-                    if (consumed == 0) break;
+                    consumed = dispatch_one(cmdbuf + pos, cmdbuf_len - pos);
+                    if (consumed <= 0) break;
                     pos += consumed;
+                }
+                if (consumed < 0) {
+                    nh_log("oversized command, dropping client", cmdbuf[pos]);
+                    break;
                 }
                 if (pos > 0) {
                     WORD remaining = cmdbuf_len - pos;
