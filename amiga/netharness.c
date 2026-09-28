@@ -177,7 +177,9 @@ static BOOL peer_allowed(const UBYTE *ip)
     char *p;
 
     if (ip[0] == 127) return TRUE;
-    sprintf(dotted, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    /* %lu + unsigned long casts: this libc's %u reads a 16-bit value, which turned
+       172.30.152.173 into "0.172.0.30" and matched no allowlist entry */
+    sprintf(dotted, "%lu.%lu.%lu.%lu", (unsigned long)ip[0], (unsigned long)ip[1], (unsigned long)ip[2], (unsigned long)ip[3]);
 
     n = GetVar((STRPTR)ALLOW_VAR, (STRPTR)list, sizeof(list),
                GVF_GLOBAL_ONLY | GVF_BINARY_VAR);
@@ -1348,9 +1350,10 @@ int main(int argc, char **argv)
         }
         /* peer is a BSD sockaddr_in: len(1) family(1) port(2) addr(4) */
         if (!peer_allowed(peer + 4)) {
-            nh_log("rejected client not in ENV:" ALLOW_VAR ", ip",
-                   (LONG)(((ULONG)peer[4] << 24) | ((ULONG)peer[5] << 16) |
-                          ((ULONG)peer[6] << 8) | peer[7]));
+            char why[80];
+            sprintf(why, "rejected %lu.%lu.%lu.%lu (not in ENV:" ALLOW_VAR "), port",
+                    (unsigned long)peer[4], (unsigned long)peer[5], (unsigned long)peer[6], (unsigned long)peer[7]);
+            nh_log(why, (LONG)g_port);
             CloseSocket(g_client);
             g_client = -1;
             continue;
