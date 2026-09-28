@@ -80,11 +80,11 @@ a genuine click would.
 **New in 1.8:**
 
 - Client allowlist: only controllers listed in `ENV:NetHarness.allow` may
-  connect. Entries are exact IPv4 addresses (`192.168.50.101`), prefixes ending
-  in a dot (`192.168.50.`) or `*`, separated by spaces or newlines; loopback is
+  connect. Entries are exact IPv4 addresses (`192.168.1.10`), prefixes ending
+  in a dot (`192.168.1.`) or `*`, separated by spaces or newlines; loopback is
   always allowed. The file is re-read on every connect. Put it in `ENVARC:` too
   so it survives a reboot:
-  `echo "192.168.50.101" >ENVARC:NetHarness.allow` + `copy ENVARC:NetHarness.allow ENV:`.
+  `echo "192.168.1.10" >ENVARC:NetHarness.allow` + `copy ENVARC:NetHarness.allow ENV:`.
   With no file the harness still accepts anyone (so an upgrade can't lock you
   out) and logs a warning to `T:netharness.log` on each connect.
 - Length-field hardening: a GETFILE/PUTFILE/EXEC length too big for the

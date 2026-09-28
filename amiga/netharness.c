@@ -161,7 +161,7 @@ static struct IOStdReq *inputio;
  * EXEC/PUTFILE/RELOAD/REBOOT give full control of the machine, so only the
  * controllers listed in ENV:NetHarness.allow may connect.  Entries are
  * separated by spaces, commas or newlines: an exact IPv4 address
- * ("192.168.50.101"), a prefix ending in a dot ("192.168.50."), or "*" for
+ * ("192.168.1.10"), a prefix ending in a dot ("192.168.1."), or "*" for
  * anyone.  Loopback is always allowed.  The file is re-read on every connect,
  * so it can be edited live (copy it to ENVARC: to survive a reboot).
  * No file = the pre-1.8 behaviour (anyone), logged as a warning on each
