@@ -77,6 +77,15 @@ a genuine click would.
   booting, WiFi rejoining, or the stack restarting - with no manual run needed
   at the machine.
 
+**New in 1.9:**
+
+- Injected keys carry every qualifier, not only Shift: `KEY` presses of Ctrl
+  (0x63), Alt (0x64/0x65) and Amiga (0x66/0x67) now reach the following keys
+  as combinations. So Amiga-key menu shortcuts (e.g. Right Amiga + E opens
+  Workbench's Execute Command), Alt-key hotkeys and Ctrl-key commands can be
+  tested: `KEY 0x67 1`, `PRESSKEY 0x12`, `KEY 0x67 0`. The host tool now takes key
+  codes in decimal or `0x` hex.
+
 **New in 1.8:**
 
 - Client allowlist: only controllers listed in `ENV:NetHarness.allow` may

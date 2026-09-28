@@ -13,8 +13,8 @@ Commands (same verbs as the A314 harness ctl.py, plus EXEC):
   MOVETO x y                absolute move (home + one delta)
   BUTTON b state            b: 0=L 1=R 2=M   state: 1=down 0=up
   CLICK x y [b]             moveto + press + release
-  KEY code state            raw Amiga keycode
-  PRESSKEY code             press + release
+  KEY code state            raw Amiga keycode (decimal or 0x hex), state 1 = down 0 = up
+  PRESSKEY code             press + release (decimal or 0x hex)
   TYPE text...              ASCII -> raw keycodes (shift handled)
   CLEARFIELD [maxlen]       right-arrow to end, then backspace it all
   SCREENSHOT [out.png]      capture the front screen (default nh_shot.png)
@@ -511,9 +511,9 @@ def run_command(nh, argv):
     elif cmd == 'CLICK':
         nh.click(int(args[0]), int(args[1]), int(args[2]) if len(args) > 2 else 0); print('OK')
     elif cmd == 'KEY':
-        nh.key(int(args[0]), bool(int(args[1]))); print('OK')
+        nh.key(int(args[0], 0), bool(int(args[1]))); print('OK')
     elif cmd == 'PRESSKEY':
-        nh.press_key(int(args[0])); print('OK')
+        nh.press_key(int(args[0], 0)); print('OK')
     elif cmd == 'TYPE':
         nh.type_text(' '.join(args)); print('OK')
     elif cmd == 'CLEARFIELD':
