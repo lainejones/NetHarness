@@ -98,7 +98,7 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.8"
+#define NH_VERSION "1.9"
 #define NH_VERDATE "25.9.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
@@ -392,10 +392,19 @@ static void do_key(UBYTE keycode, UBYTE down)
     struct InputEvent ie;
     memset(&ie, 0, sizeof(ie));
 
-    if (keycode == RAWKEY_LSHIFT) {
-        g_key_qualifier = down ? (g_key_qualifier | IEQUALIFIER_LSHIFT) : (g_key_qualifier & ~IEQUALIFIER_LSHIFT);
-    } else if (keycode == RAWKEY_RSHIFT) {
-        g_key_qualifier = down ? (g_key_qualifier | IEQUALIFIER_RSHIFT) : (g_key_qualifier & ~IEQUALIFIER_RSHIFT);
+    {   /* every qualifier key, not only Shift: Alt+key, Ctrl+key and Amiga+key reach the
+         * program as combinations (hotkeys, menu shortcuts) */
+        UWORD q = 0;
+        switch (keycode) {
+        case RAWKEY_LSHIFT: q = IEQUALIFIER_LSHIFT; break;
+        case RAWKEY_RSHIFT: q = IEQUALIFIER_RSHIFT; break;
+        case 0x63: q = IEQUALIFIER_CONTROL; break;
+        case 0x64: q = IEQUALIFIER_LALT; break;
+        case 0x65: q = IEQUALIFIER_RALT; break;
+        case 0x66: q = IEQUALIFIER_LCOMMAND; break;
+        case 0x67: q = IEQUALIFIER_RCOMMAND; break;
+        }
+        if (q) g_key_qualifier = down ? (g_key_qualifier | q) : (g_key_qualifier & ~q);
     }
 
     ie.ie_Class     = IECLASS_RAWKEY;
