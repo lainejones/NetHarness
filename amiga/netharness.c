@@ -35,6 +35,13 @@
  *     CMD_SHOT_REGION  = 15  payload: x2 y2 w2 h2     (partial screenshot)
  *     CMD_GETFILE      = 16  payload: len2 path[len]
  *     CMD_PUTFILE      = 17  payload: plen2 path[plen] dlen4 data[dlen]
+ *   v1.10 additions:
+ *     CMD_EXEC_T       = 19  payload: secs2 len2 cmdline[len]  (EXEC with a
+ *       time limit, 0 = none; on timeout the command gets Ctrl-C, and the
+ *       reply's rc is -2 with a note after its output)
+ *     CMD_HELLO        = 20  payload: none  -> RESP_TEXT "netharness <ver>"
+ *       (an older harness drops the unknown byte, so a client can send HELLO
+ *       then PING and tell from the replies whether EXEC_T is understood)
  *     CMD_RELOAD       = 18  payload: none  (apply a staged
  *       C:netharness.new and restart IN PLACE - no machine reboot;
  *       ColdReboot() greyscreens some machines. Replies ACK+1 on
@@ -98,8 +105,8 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.9"
-#define NH_VERDATE "25.9.2026"
+#define NH_VERSION "1.10"
+#define NH_VERDATE "30.9.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
 
@@ -121,6 +128,8 @@ static const char verstag[] __attribute__((used)) =
 #define CMD_GETFILE      16
 #define CMD_PUTFILE      17
 #define CMD_RELOAD       18
+#define CMD_EXEC_T       19
+#define CMD_HELLO        20
 
 #define RESP_SCREENSHOT_HDR 0x81
 #define RESP_ACK            0x82
@@ -135,7 +144,9 @@ static const char verstag[] __attribute__((used)) =
 #define BINARY_PATH    "C:netharness"
 
 #define EXEC_CMD_MAX   512          /* max AmigaDOS command line we accept */
-#define EXEC_OUT_FILE  "T:netharness.out"
+#define EXEC_OUT_FMT   "T:netharness.out.%lu"   /* one file per job */
+#define EXEC_DEFAULT_SECS 600       /* plain CMD_EXEC: 10 minutes, then Ctrl-C */
+#define EXEC_GRACE_SECS   5         /* after Ctrl-C, how long to wait for it to end */
 
 struct IntuitionBase *IntuitionBase = NULL;
 struct GfxBase       *GfxBase       = NULL;
@@ -562,28 +573,42 @@ out:
 
 /* ---- EXEC ---------------------------------------------------------------- */
 
-static void do_exec(const UBYTE *cmd, UWORD len)
-{
-    char  cmdline[EXEC_CMD_MAX + 1];
-    BPTR  in, out, rd;
-    LONG  rc = -1;
-    LONG  outlen = 0;
-    UBYTE hdr[9];
-    UBYTE iobuf[1024];
+/* v1.10: the command runs in a worker process and we wait for it with a time
+ * limit.  Before, do_exec() called SystemTags() itself, so a command that
+ * hung (a socket wait, a lost requester, a deadlocked test) wedged the whole
+ * harness: no PING, no BREAK, and on a machine without an A314 the only way
+ * back was a human at the keyboard (three times on 2026-09-30).
+ *
+ * On timeout the command's shell process gets Ctrl-C (it is found by the name
+ * we give it, NP_Name "nh_exec <n>"), and after EXEC_GRACE_SECS we answer
+ * either way: rc -2 and a note after whatever output it wrote.  A command that
+ * ignores Ctrl-C is ABANDONED: the worker frees its own job when it finally
+ * ends, and its output file (one per job) stays behind in T:. */
+struct ExecJob {
+    struct Task  *parent;
+    LONG          sig;
+    volatile LONG rc;
+    volatile UBYTE done, abandoned;
+    char          cmd[EXEC_CMD_MAX + 1];
+    char          out[32];
+    char          name[24];
+};
 
-    if (len > EXEC_CMD_MAX) len = EXEC_CMD_MAX;
-    memcpy(cmdline, cmd, len);
-    cmdline[len] = 0;
+static ULONG g_jobno = 0;
+
+static void exec_worker(void)
+{
+    struct ExecJob *j = (struct ExecJob *)FindTask(NULL)->tc_UserData;
+    BPTR in, out;
+    LONG rc = -1;
 
     in  = Open((STRPTR)"NIL:", MODE_OLDFILE);
-    out = Open((STRPTR)EXEC_OUT_FILE, MODE_NEWFILE);
+    out = Open((STRPTR)j->out, MODE_NEWFILE);
     if (out) {
-        /* Synchronous System(): we keep ownership of the handles and close
-         * them ourselves.  Child runs at priority 0 so a busy command can't
-         * starve this task (which sits above it). */
-        rc = SystemTags((STRPTR)cmdline,
+        rc = SystemTags((STRPTR)j->cmd,
                         SYS_Input,    (Tag)in,
                         SYS_Output,   (Tag)out,
+                        NP_Name,      (Tag)j->name,
                         NP_Priority,  (Tag)0,
                         NP_WindowPtr, (Tag)-1L,   /* no DOS requesters - see main() */
                         TAG_DONE);
@@ -591,36 +616,137 @@ static void do_exec(const UBYTE *cmd, UWORD len)
     }
     if (in) Close(in);
 
-    /* Measure the captured output. */
-    rd = Open((STRPTR)EXEC_OUT_FILE, MODE_OLDFILE);
+    Forbid();
+    j->rc = rc;
+    j->done = 1;
+    if (j->abandoned) FreeVec(j);             /* nobody is waiting any more */
+    else Signal(j->parent, 1UL << j->sig);
+    /* return while still Forbid()den: this process is gone before the harness
+       could exit and unload the code we are running */
+}
+
+static void do_exec(const UBYTE *cmd, UWORD len, UWORD secs)
+{
+    struct ExecJob *j;
+    struct Process *proc = NULL;
+    BPTR  rd = 0;
+    LONG  rc = -1, outlen = 0, sig, waited, limit;
+    BOOL  timedout = FALSE, abandoned = FALSE, broke = FALSE;
+    char  note[160];
+    UBYTE hdr[9];
+    UBYTE iobuf[1024];
+
+    note[0] = 0;
+    if (len > EXEC_CMD_MAX) len = EXEC_CMD_MAX;
+    j = (struct ExecJob *)AllocVec(sizeof(*j), MEMF_PUBLIC | MEMF_CLEAR);
+    sig = j ? AllocSignal(-1) : -1;
+    if (j && sig >= 0) {
+        memcpy(j->cmd, cmd, len);
+        j->cmd[len] = 0;
+        j->parent = FindTask(NULL);
+        j->sig = sig;
+        g_jobno++;
+        sprintf(j->out, EXEC_OUT_FMT, (unsigned long)g_jobno);
+        sprintf(j->name, "nh_exec %lu", (unsigned long)g_jobno);
+        SetSignal(0, 1UL << sig);
+        Forbid();                             /* it can't run before it has its job */
+        proc = CreateNewProcTags(NP_Entry,     (Tag)exec_worker,
+                                 NP_Name,      (Tag)"netharness exec",
+                                 NP_StackSize, (Tag)8192,
+                                 NP_Priority,  (Tag)0,
+                                 /* a CLI of its own: it copies OUR command path and
+                                    current dir, which System() then hands on - without
+                                    it the command saw only C: ("rx: Unknown command") */
+                                 NP_Cli,       (Tag)TRUE,
+                                 TAG_DONE);
+        if (proc) proc->pr_Task.tc_UserData = (APTR)j;
+        Permit();
+    }
+    if (!proc) {
+        if (sig >= 0) FreeSignal(sig);
+        if (j) FreeVec(j);
+        sprintf(note, "netharness: could not start the command\n");
+        goto reply;
+    }
+
+    /* wait: the job's signal, polled with Delay so the time limit needs no timer */
+    limit = secs ? (LONG)secs * 50 : 0x7fffffffL;
+    for (waited = 0; !j->done && waited < limit; waited += 5) Delay(5);
+    if (!j->done) {
+        struct Task *t;
+        timedout = TRUE;
+        Forbid();
+        t = FindTask((STRPTR)j->name);
+        if (t) { Signal(t, SIGBREAKF_CTRL_C); broke = TRUE; }
+        Permit();
+        for (waited = 0; !j->done && waited < EXEC_GRACE_SECS * 50; waited += 5) Delay(5);
+    }
+    Forbid();
+    if (!j->done) { j->abandoned = 1; abandoned = TRUE; }
+    Permit();
+
+    if (abandoned) {
+        rc = -2;
+        sprintf(note, "\n*** netharness: timed out after %lu s; %s - still running as \"%s\", output in %s\n",
+                (unsigned long)secs, broke ? "Ctrl-C did not stop it" : "its process was not found to break",
+                j->name, j->out);
+        FreeSignal(sig);                      /* the worker frees the job itself */
+        goto reply;
+    }
+    rc = timedout ? -2 : j->rc;
+    if (timedout)
+        sprintf(note, "\n*** netharness: timed out after %lu s; stopped with Ctrl-C (rc %ld)\n",
+                (unsigned long)secs, (long)j->rc);
+    rd = Open((STRPTR)j->out, MODE_OLDFILE);
     if (rd) {
         Seek(rd, 0, OFFSET_END);
         outlen = Seek(rd, 0, OFFSET_BEGINNING);
         if (outlen < 0) outlen = 0;
     }
+    FreeSignal(sig);
 
-    hdr[0] = RESP_EXEC;
-    hdr[1] = (UBYTE)(rc >> 24); hdr[2] = (UBYTE)(rc >> 16);
-    hdr[3] = (UBYTE)(rc >>  8); hdr[4] = (UBYTE)rc;
-    hdr[5] = (UBYTE)(outlen >> 24); hdr[6] = (UBYTE)(outlen >> 16);
-    hdr[7] = (UBYTE)(outlen >>  8); hdr[8] = (UBYTE)outlen;
-    if (!send_all(hdr, sizeof(hdr))) {
-        if (rd) Close(rd);
-        return;
-    }
-
-    if (rd) {
-        LONG left = outlen;
-        while (left > 0) {
-            LONG want = (left > (LONG)sizeof(iobuf)) ? (LONG)sizeof(iobuf) : left;
-            LONG n = Read(rd, iobuf, want);
-            if (n <= 0) break;
-            if (!send_all(iobuf, n)) break;
-            left -= n;
+reply:
+    {
+        LONG notelen = (LONG)strlen(note), total = outlen + notelen;
+        hdr[0] = RESP_EXEC;
+        hdr[1] = (UBYTE)(rc >> 24); hdr[2] = (UBYTE)(rc >> 16);
+        hdr[3] = (UBYTE)(rc >>  8); hdr[4] = (UBYTE)rc;
+        hdr[5] = (UBYTE)(total >> 24); hdr[6] = (UBYTE)(total >> 16);
+        hdr[7] = (UBYTE)(total >>  8); hdr[8] = (UBYTE)total;
+        if (send_all(hdr, sizeof(hdr))) {
+            LONG left = outlen;
+            while (rd && left > 0) {
+                LONG want = (left > (LONG)sizeof(iobuf)) ? (LONG)sizeof(iobuf) : left;
+                LONG n = Read(rd, iobuf, want);
+                if (n <= 0) break;
+                if (!send_all(iobuf, n)) { left = -1; break; }
+                left -= n;
+            }
+            while (left > 0) {                /* short file: pad so the length holds */
+                LONG n = left > (LONG)sizeof(iobuf) ? (LONG)sizeof(iobuf) : left;
+                memset(iobuf, ' ', n);
+                if (!send_all(iobuf, n)) break;
+                left -= n;
+            }
+            if (notelen && left >= 0) send_all((UBYTE *)note, notelen);
         }
-        Close(rd);
-        DeleteFile((STRPTR)EXEC_OUT_FILE);
     }
+    if (rd) {
+        Close(rd);
+        DeleteFile((STRPTR)j->out);
+    }
+    if (proc && !abandoned) FreeVec(j);
+}
+
+/* v1.10: HELLO -> RESP_TEXT "netharness <version>" */
+static void do_hello(void)
+{
+    static const char txt[] = "netharness " NH_VERSION;
+    UBYTE h[5];
+    ULONG n = sizeof(txt) - 1;
+    h[0] = RESP_TEXT;
+    h[1] = (UBYTE)(n >> 24); h[2] = (UBYTE)(n >> 16); h[3] = (UBYTE)(n >> 8); h[4] = (UBYTE)n;
+    if (send_all(h, 5)) send_all((UBYTE *)txt, n);
 }
 
 /* ---- v1.3: pointer readback, semantic UI tree, regions, file transfer ----- */
@@ -1038,6 +1164,7 @@ static void flush_all_filesystems(void)
  * SO_REUSEADDR is already set. */
 
 static BOOL g_reload = FALSE;
+static void release_single(void);           /* v1.10, below with the port setup */
 
 static BOOL file_exists(const char *path)
 {
@@ -1089,7 +1216,9 @@ static void do_reload(void)
     if (g_client >= 0) { CloseSocket(g_client); g_client = -1; }
     if (g_listen >= 0) { CloseSocket(g_listen); g_listen = -1; }
 
-    /* 3. hand off. `run` returns immediately, so this does not block us. */
+    /* 3. hand off. `run` returns immediately, so this does not block us.
+       The single-instance port goes first, or the replacement would exit. */
+    release_single();
     run_quiet("run >NIL: " BINARY_PATH);
     nh_log("reload: handed off, exiting", 0);
     g_reload = TRUE;
@@ -1201,9 +1330,22 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
                 UWORD clen = (UWORD)((b[1] << 8) | b[2]);
                 if (3L + clen > CMDBUF_SIZE) return -1;
                 if ((LONG)avail < 3L + clen) return 0;
-                do_exec(b + 3, clen);
+                do_exec(b + 3, clen, EXEC_DEFAULT_SECS);
                 return (WORD)(3 + clen);
             }
+        case CMD_EXEC_T:
+            if (avail < 5) return 0;
+            {
+                UWORD secs = (UWORD)((b[1] << 8) | b[2]);
+                UWORD clen = (UWORD)((b[3] << 8) | b[4]);
+                if (5L + clen > CMDBUF_SIZE) return -1;
+                if ((LONG)avail < 5L + clen) return 0;
+                do_exec(b + 5, clen, secs);
+                return (WORD)(5 + clen);
+            }
+        case CMD_HELLO:
+            do_hello();
+            return 1;
         case CMD_PING:
             send_ack();
             return 1;
@@ -1230,6 +1372,61 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
 #define BRINGUP_SLOW_DELAY     500     /* Delay() ticks: 10s */
 
 static UWORD g_port   = LISTEN_PORT;   /* overridable: `netharness 7801` */
+
+/* ---- v1.10: one harness per port ------------------------------------------
+ * A machine that starts the harness twice (the A1200's User-Startup had two
+ * lines) used to keep the second copy alive forever, retrying bind every 10s.
+ * A running harness now owns a public port "NetHarness.<tcp port>"; a new one
+ * that finds it - and finds its owner still alive - exits at once.  RELOAD
+ * gives the port up before it launches the replacement, and a port left by a
+ * crashed instance (owner gone) is taken over. */
+static struct MsgPort *g_single = NULL;
+static char g_single_name[24];
+
+static BOOL task_alive(struct Task *t)
+{
+    struct Node *n;
+    BOOL found = FALSE;
+    if (!t) return FALSE;
+    Disable();                                /* the lists change in interrupts */
+    if ((struct Task *)SysBase->ThisTask == t) found = TRUE;
+    for (n = SysBase->TaskReady.lh_Head; !found && n->ln_Succ; n = n->ln_Succ)
+        if ((struct Task *)n == t) found = TRUE;
+    for (n = SysBase->TaskWait.lh_Head; !found && n->ln_Succ; n = n->ln_Succ)
+        if ((struct Task *)n == t) found = TRUE;
+    Enable();
+    return found;
+}
+
+static BOOL claim_single(void)
+{
+    struct MsgPort *old;
+    sprintf(g_single_name, "NetHarness.%lu", (unsigned long)g_port);
+    g_single = CreateMsgPort();
+    if (!g_single) return TRUE;               /* can't tell - run anyway */
+    g_single->mp_Node.ln_Name = g_single_name;
+    g_single->mp_Node.ln_Pri  = 0;
+    Forbid();
+    old = FindPort((STRPTR)g_single_name);
+    if (old && task_alive((struct Task *)old->mp_SigTask)) {
+        Permit();
+        DeleteMsgPort(g_single);
+        g_single = NULL;
+        return FALSE;
+    }
+    if (old) RemPort(old);                    /* left behind by a crashed instance */
+    AddPort(g_single);
+    Permit();
+    return TRUE;
+}
+
+static void release_single(void)
+{
+    if (!g_single) return;
+    RemPort(g_single);
+    DeleteMsgPort(g_single);
+    g_single = NULL;
+}
 
 static BOOL server_up(void)
 {
@@ -1284,6 +1481,17 @@ int main(int argc, char **argv)
         while (*s >= '0' && *s <= '9') p = (UWORD)(p * 10 + (*s++ - '0'));
         if (p) g_port = p;
     }
+
+    if (!claim_single()) {
+        printf("netharness: another netharness already serves port %lu - exiting\n", (unsigned long)g_port);
+        return 5;
+    }
+    {
+        struct DateStamp ds;
+        DateStamp(&ds);                       /* job numbers differ across restarts */
+        g_jobno = (ULONG)ds.ds_Minute * 3000UL + (ULONG)ds.ds_Tick;
+    }
+    run_quiet("C:Delete T:netharness.out.#? QUIET");   /* leftovers of abandoned jobs */
 
     /* Modest boost: stay responsive above busy apps, but EXEC children are
      * explicitly started at 0 so they can't be starved by us either. */
@@ -1445,6 +1653,7 @@ cleanup_libs:
     if (SocketBase)    CloseLibrary(SocketBase);
     if (GfxBase)       CloseLibrary((struct Library *)GfxBase);
     if (IntuitionBase) CloseLibrary((struct Library *)IntuitionBase);
+    release_single();
     SetTaskPri(FindTask(NULL), old_priority);
     return 0;
 }

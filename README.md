@@ -28,6 +28,7 @@ by hand. NetHarness turns that into something a script can drive.
 | `RESETINPUT` | Release any stuck buttons or qualifiers |
 | `REBOOT` | Cold-reboot the machine (flushes disks first) |
 | `PING` | Liveness check |
+| `VERSION` | The harness version (1.10+) |
 
 Input is injected through `input.device` (`IND_WRITEEVENT`), the same path real
 hardware uses, so it exercises window activation, GadTools, menus — everything
@@ -196,8 +197,20 @@ not by looking for the cursor.
 - **DOS requesters are suppressed** (`pr_WindowPtr = -1`). A command touching a
   missing volume would otherwise raise "Please insert volume…" and block the
   single-threaded harness with no way to dismiss it remotely.
-- **`EXEC` is synchronous.** A command that never returns holds the connection,
-  so start long-lived programs with `EXEC run >NIL: <program>`.
+- **`EXEC` has a time limit (1.10).** The command runs in a helper process and
+  the harness waits at most the limit (`nhctl.py --timeout SECS`, default 120;
+  a 1.9-style `EXEC` gets 10 minutes). When it runs out, the command is sent
+  Ctrl-C and you get its output so far with `rc=TIMEOUT`; one that ignores
+  Ctrl-C is left running (the note names it) and the harness carries on.
+  Before 1.10 a hung command wedged the harness until someone reached the
+  machine. Long-lived programs still belong in `EXEC run >NIL: <program>`.
+- **One harness per port (1.10).** A second copy started on a port that
+  already has a live harness exits at once instead of retrying forever, so a
+  doubled line in `S:User-Startup` costs nothing. `RELOAD` hands the port over
+  as before; a copy on a spare port (`netharness 7810`) runs alongside.
+- **`nhctl.py VERSION`** asks a 1.10+ harness its version (`HELLO`); an older
+  one ignores the question and answers `PING`, which is how the client knows
+  whether to use the time-limited `EXEC`.
 - There is **no authentication**. It executes commands as sent — use it on a
   network you trust, not a public one.
 

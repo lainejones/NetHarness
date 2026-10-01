@@ -4,7 +4,12 @@
 Direct TCP client - no Pi middleman.  One command per invocation, or
 --batch to read newline-separated commands from stdin over one connection.
 
-  python3 nhctl.py [--host 192.168.50.32] [--port 7800] COMMAND [args...]
+  python3 nhctl.py [--host 192.168.50.32] [--port 7800] [--timeout SECS] COMMAND [args...]
+
+  --timeout SECS   limit for EXEC (default 120).  With a 1.10+ harness the
+                   AMIGA enforces it: the command gets Ctrl-C and you get its
+                   output so far with rc=-2 - the harness stays usable.  An
+                   older harness only drops the connection on our side.
 
 Commands (same verbs as the A314 harness ctl.py, plus EXEC):
   PING                      liveness check (waits for the Amiga's ack)
@@ -19,6 +24,8 @@ Commands (same verbs as the A314 harness ctl.py, plus EXEC):
   CLEARFIELD [maxlen]       right-arrow to end, then backspace it all
   SCREENSHOT [out.png]      capture the front screen (default nh_shot.png)
   EXEC command...           run an AmigaDOS command, print rc + output
+                            (rc=TIMEOUT, exit 2: stopped after --timeout secs)
+  VERSION                   the harness version (1.10+), via HELLO
   RESETINPUT                release any held buttons/qualifiers
   REBOOT                    ColdReboot() - connection drops, machine restarts
 
@@ -60,6 +67,9 @@ CMD_SCREENSHOT, CMD_REBOOT, CMD_RESET_INPUT, CMD_EXEC, CMD_PING = 5, 6, 7, 8, 9
 CMD_POINTER, CMD_UITREE, CMD_MENUS, CMD_SCREENS = 10, 11, 12, 13
 CMD_REGION_SUM, CMD_SHOT_REGION, CMD_GETFILE, CMD_PUTFILE = 14, 15, 16, 17
 CMD_RELOAD = 18
+CMD_EXEC_T, CMD_HELLO = 19, 20          # v1.10
+RESP_TEXT = 0x85
+EXEC_TIMED_OUT = -2
 RESP_SCREENSHOT_HDR, RESP_ACK, RESP_EXEC = 0x81, 0x82, 0x83
 RESP_POINTER, RESP_TEXT, RESP_FILE, RESP_SUM = 0x84, 0x85, 0x86, 0x87
 
@@ -100,6 +110,34 @@ class NetHarness:
     def __init__(self, host, port, timeout=30):
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
+        self._version = False                 # False = not asked yet, None = pre-1.10
+
+    def version(self):
+        """The harness version from HELLO (1.10+), or None for an older one.
+        HELLO is sent with a PING behind it: an old harness drops the unknown
+        HELLO byte and only ACKs the PING, so either way exactly one ACK ends it."""
+        if self._version is False:
+            self.sock.sendall(bytes([CMD_HELLO, CMD_PING]))
+            b = self._recv_exactly(1)
+            if b[0] == RESP_TEXT:
+                n = struct.unpack('>I', self._recv_exactly(4))[0]
+                txt = self._recv_exactly(n).decode('latin-1', 'replace')
+                self._version = txt.split()[-1]
+                b = self._recv_exactly(1)
+            else:
+                self._version = None
+            if b[0] != RESP_ACK:
+                raise ConnectionError(f'expected ACK after HELLO, got 0x{b[0]:02x}')
+        return self._version
+
+    def has_exec_timeout(self):
+        v = self.version()
+        if not v:
+            return False
+        try:
+            return tuple(int(x) for x in v.split('.')[:2]) >= (1, 10)
+        except ValueError:
+            return False
 
     # ---- low level -------------------------------------------------------
 
@@ -475,9 +513,16 @@ class NetHarness:
     # ---- EXEC ------------------------------------------------------------------
 
     def exec_cmd(self, cmdline, timeout=120):
+        """Run an AmigaDOS command; returns (rc, output).  rc == EXEC_TIMED_OUT
+        (-2): a 1.10+ harness stopped it after `timeout` seconds."""
         data = cmdline.encode('latin-1')
-        self.sock.settimeout(timeout)
-        self.sock.sendall(bytes([CMD_EXEC]) + struct.pack('>H', len(data)) + data)
+        if self.has_exec_timeout():
+            secs = max(1, min(int(timeout), 65535))
+            self.sock.settimeout(secs + 30)   # the Amiga answers by secs + its 5s grace
+            self.sock.sendall(bytes([CMD_EXEC_T]) + struct.pack('>HH', secs, len(data)) + data)
+        else:
+            self.sock.settimeout(timeout)
+            self.sock.sendall(bytes([CMD_EXEC]) + struct.pack('>H', len(data)) + data)
         hdr = self._recv_exactly(9)
         if hdr[0] != RESP_EXEC:
             raise ConnectionError(f'expected EXEC response, got 0x{hdr[0]:02x}')
@@ -488,6 +533,9 @@ class NetHarness:
     def reboot(self):
         self.sock.sendall(bytes([CMD_REBOOT]))
         # no response - the machine is resetting
+
+
+EXEC_TIMEOUT = 120
 
 
 def run_command(nh, argv):
@@ -570,10 +618,15 @@ def run_command(nh, argv):
     elif cmd == 'PUTFILE':
         n = nh.put_file(args[0], args[1]); print(f'OK put {n} bytes -> {args[1]}')
     elif cmd == 'EXEC':
-        rc, out = nh.exec_cmd(' '.join(args))
-        print(f'rc={rc}')
+        rc, out = nh.exec_cmd(' '.join(args), EXEC_TIMEOUT)
+        print('rc=TIMEOUT' if rc == EXEC_TIMED_OUT else f'rc={rc}')
         if out:
             print(out, end='' if out.endswith('\n') else '\n')
+        if rc == EXEC_TIMED_OUT:
+            return 2
+    elif cmd == 'VERSION':
+        v = nh.version()
+        print(f'netharness {v}' if v else 'netharness older than 1.10 (no HELLO)')
     elif cmd == 'REBOOT':
         nh.reboot(); print('OK (Amiga rebooting)')
     else:
@@ -598,6 +651,9 @@ def main():
             host = argv[1]; argv = argv[2:]
         elif argv[0] == '--port':
             port = int(argv[1]); argv = argv[2:]
+        elif argv[0] == '--timeout':
+            global EXEC_TIMEOUT
+            EXEC_TIMEOUT = int(argv[1]); argv = argv[2:]
         elif argv[0] == '--batch':
             argv = argv[1:]
             nh = NetHarness(host, port)
@@ -616,8 +672,16 @@ def main():
     if not argv:
         print(__doc__)
         return 1
-    nh = NetHarness(host, port)
-    return run_command(nh, argv)
+    try:
+        nh = NetHarness(host, port)
+        return run_command(nh, argv)
+    except (socket.timeout, TimeoutError):
+        print(f'netharness {host}:{port}: no answer in time - the Amiga may still be busy '
+              f'(1.10+ stops a long EXEC itself; use --timeout)', file=sys.stderr)
+        return 3
+    except (ConnectionError, OSError) as e:
+        print(f'netharness {host}:{port}: {e}', file=sys.stderr)
+        return 3
 
 
 if __name__ == '__main__':
