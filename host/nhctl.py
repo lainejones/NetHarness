@@ -25,7 +25,8 @@ Commands (same verbs as the A314 harness ctl.py, plus EXEC):
   SCREENSHOT [out.png]      capture the front screen (default nh_shot.png)
   EXEC command...           run an AmigaDOS command, print rc + output
                             (rc=TIMEOUT, exit 2: stopped after --timeout secs)
-  VERSION                   the harness version (1.10+), via HELLO
+  VERSION                   the harness version and where it runs from (1.10+)
+  UPDATE file               stage file next to the running harness and RELOAD (1.10+)
   RESETINPUT                release any held buttons/qualifiers
   REBOOT                    ColdReboot() - connection drops, machine restarts
 
@@ -111,6 +112,7 @@ class NetHarness:
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
         self._version = False                 # False = not asked yet, None = pre-1.10
+        self.prog_path = None                 # where the harness binary lives (1.10+)
 
     def version(self):
         """The harness version from HELLO (1.10+), or None for an older one.
@@ -122,7 +124,9 @@ class NetHarness:
             if b[0] == RESP_TEXT:
                 n = struct.unpack('>I', self._recv_exactly(4))[0]
                 txt = self._recv_exactly(n).decode('latin-1', 'replace')
-                self._version = txt.split()[-1]
+                parts = txt.split(None, 3)    # netharness <ver> [<port> <path>]
+                self._version = parts[1] if len(parts) > 1 else '?'
+                self.prog_path = parts[3] if len(parts) > 3 else None
                 b = self._recv_exactly(1)
             else:
                 self._version = None
@@ -626,7 +630,20 @@ def run_command(nh, argv):
             return 2
     elif cmd == 'VERSION':
         v = nh.version()
-        print(f'netharness {v}' if v else 'netharness older than 1.10 (no HELLO)')
+        print(f'netharness {v}' + (f' ({nh.prog_path})' if nh.prog_path else '') if v
+              else 'netharness older than 1.10 (no HELLO)')
+    elif cmd == 'UPDATE':
+        # stage the new binary next to the RUNNING one (it reports where) and RELOAD
+        if not nh.version() or not nh.prog_path:
+            print('UPDATE needs a 1.10+ harness (it reports its own path); for older ones: '
+                  'PUTFILE <file> C:netharness.new, then RELOAD', file=sys.stderr)
+            return 1
+        n = nh.put_file(args[0], nh.prog_path + '.new')
+        print(f'staged {n} bytes as {nh.prog_path}.new')
+        if not nh.reload():
+            print('REFUSED - could not apply the staged update; old build still running')
+            return 1
+        print(f'OK reloading {nh.prog_path} - check with VERSION in a few seconds')
     elif cmd == 'REBOOT':
         nh.reboot(); print('OK (Amiga rebooting)')
     else:

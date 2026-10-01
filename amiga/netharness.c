@@ -39,7 +39,7 @@
  *     CMD_EXEC_T       = 19  payload: secs2 len2 cmdline[len]  (EXEC with a
  *       time limit, 0 = none; on timeout the command gets Ctrl-C, and the
  *       reply's rc is -2 with a note after its output)
- *     CMD_HELLO        = 20  payload: none  -> RESP_TEXT "netharness <ver>"
+ *     CMD_HELLO        = 20  payload: none  -> RESP_TEXT "netharness <ver> <port> <path>"
  *       (an older harness drops the unknown byte, so a client can send HELLO
  *       then PING and tell from the replies whether EXEC_T is understood)
  *     CMD_RELOAD       = 18  payload: none  (apply a staged
@@ -218,6 +218,7 @@ static BOOL peer_allowed(const UBYTE *ip)
     return FALSE;
 }
 
+static UWORD g_port   = LISTEN_PORT;   /* overridable: `netharness 7801` */
 static LONG g_client = -1;          /* accepted client socket, -1 = none */
 static LONG g_listen = -1;          /* listening socket (RELOAD frees it) */
 static WORD g_shutdown = 0;         /* stack is going away: close up and exit */
@@ -740,11 +741,15 @@ reply:
 }
 
 /* v1.10: HELLO -> RESP_TEXT "netharness <version>" */
+static const char *own_path(void);
+
 static void do_hello(void)
 {
-    static const char txt[] = "netharness " NH_VERSION;
+    char  txt[220];
     UBYTE h[5];
-    ULONG n = sizeof(txt) - 1;
+    ULONG n;
+    sprintf(txt, "netharness " NH_VERSION " %lu %s", (unsigned long)g_port, own_path());
+    n = strlen(txt);
     h[0] = RESP_TEXT;
     h[1] = (UBYTE)(n >> 24); h[2] = (UBYTE)(n >> 16); h[3] = (UBYTE)(n >> 8); h[4] = (UBYTE)n;
     if (send_all(h, 5)) send_all((UBYTE *)txt, n);
@@ -1193,20 +1198,42 @@ static LONG run_quiet(const char *cmd)
     return rc;
 }
 
+/* v1.10: the binary we were started from ("WorkBench:netharness" on the
+ * WinUAE machines, "DH0:TestSuite/netharness" on the A1200, ...), so RELOAD
+ * updates and restarts THAT file, on OUR port.  It used to hard-code
+ * C:netharness and no port: on a harness serving 7801 next to one on 7800 the
+ * replacement would have tried 7800 and never come back. */
+static char g_prog[160];
+
+static const char *own_path(void)
+{
+    if (!g_prog[0]) {
+        if (!GetProgramName((STRPTR)g_prog, sizeof(g_prog)) || !g_prog[0])
+            strcpy(g_prog, BINARY_PATH);
+    }
+    return g_prog;
+}
+
 static void do_reload(void)
 {
     UBYTE hdr[2];
+    char  newf[180], cmd[400];
+    const char *prog = own_path();
 
-    /* 1. apply a staged update while we are still able to answer. */
-    if (file_exists(BINARY_PATH ".new")) {
-        if (run_quiet("C:Copy " BINARY_PATH ".new " BINARY_PATH " CLONE") != 0) {
+    /* 1. apply a staged <prog>.new while we are still able to answer. */
+    sprintf(newf, "%s.new", prog);
+    if (file_exists(newf)) {
+        sprintf(cmd, "C:Copy \"%s\" \"%s\" CLONE", newf, prog);
+        if (run_quiet(cmd) != 0) {
             nh_log("reload: copy of .new FAILED, staying on the old build", 0);
             hdr[0] = RESP_ACK; hdr[1] = 0;      /* 0 = refused, still running */
             send_all(hdr, 2);
             return;
         }
-        run_quiet("C:Delete " BINARY_PATH ".new QUIET");
-        run_quiet("C:Protect " BINARY_PATH " +e");
+        sprintf(cmd, "C:Delete \"%s\" QUIET", newf);
+        run_quiet(cmd);
+        sprintf(cmd, "C:Protect \"%s\" +e", prog);
+        run_quiet(cmd);
         nh_log("reload: applied staged update", 0);
     }
 
@@ -1220,7 +1247,8 @@ static void do_reload(void)
     /* 3. hand off. `run` returns immediately, so this does not block us.
        The single-instance port goes first, or the replacement would exit. */
     release_single();
-    run_quiet("run >NIL: " BINARY_PATH);
+    sprintf(cmd, "run >NIL: \"%s\" %lu", prog, (unsigned long)g_port);
+    run_quiet(cmd);
     nh_log("reload: handed off, exiting", 0);
     g_reload = TRUE;
 }
@@ -1372,7 +1400,6 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
 #define BRINGUP_FAST_DELAY     100     /* Delay() ticks: 2s */
 #define BRINGUP_SLOW_DELAY     500     /* Delay() ticks: 10s */
 
-static UWORD g_port   = LISTEN_PORT;   /* overridable: `netharness 7801` */
 
 /* ---- v1.10: one harness per port ------------------------------------------
  * A machine that starts the harness twice (the A1200's User-Startup had two
@@ -1493,6 +1520,7 @@ int main(int argc, char **argv)
         g_jobno = (ULONG)ds.ds_Minute * 3000UL + (ULONG)ds.ds_Tick;
     }
     run_quiet("C:Delete T:netharness.out.#? QUIET");   /* leftovers of abandoned jobs */
+    own_path();                               /* remember where we were started from */
 
     /* Modest boost: stay responsive above busy apps, but EXEC children are
      * explicitly started at 0 so they can't be starved by us either. */
