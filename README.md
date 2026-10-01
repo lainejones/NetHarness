@@ -78,6 +78,21 @@ a genuine click would.
   booting, WiFi rejoining, or the stack restarting - with no manual run needed
   at the machine.
 
+**New in 1.10:**
+
+- `EXEC` can no longer wedge the harness: the command runs in a helper
+  process with a time limit (`nhctl.py --timeout SECS`, default 120). When it
+  runs out the command gets Ctrl-C and you get its output so far with
+  `rc=TIMEOUT`; one that ignores Ctrl-C is left running and named in the reply,
+  and the harness carries on serving.
+- One harness per port: a second copy on a port that already has a live
+  harness exits at once (a doubled line in `S:User-Startup` is harmless).
+- `RELOAD` updates and restarts the binary the harness was started from, on
+  its own port - before, it assumed `C:netharness` on 7800. `nhctl.py UPDATE
+  <file>` stages the new build in the right place and reloads in one step.
+- `nhctl.py VERSION` asks the harness its version, path and port. Older
+  harnesses still work with the new `nhctl.py`.
+
 **New in 1.9:**
 
 - Injected keys carry every qualifier, not only Shift: `KEY` presses of Ctrl
@@ -187,8 +202,9 @@ not by looking for the cursor.
   command that lands on nothing looks exactly like one that worked.
 - **Prefer `RELOAD` over `REBOOT` for updates.** `REBOOT` calls `ColdReboot()`,
   and not every machine survives a warm CPU reset - one of the test machines
-  here (an A2000) lands on a grey screen and needs a power cycle. `RELOAD` applies a staged `C:netharness.new` and restarts the
-  harness in place instead, which is what rebooting was being used for anyway.
+  here (an A2000) lands on a grey screen and needs a power cycle. `RELOAD` applies a staged `<harness path>.new`
+  (`C:netharness.new` before 1.10) and restarts the harness in place instead, which is what rebooting was
+  being used for anyway; `nhctl.py UPDATE <file>` stages and reloads in one go.
   It applies the update *while still serving*, so a failed copy leaves the
   working build running rather than bricking your remote access.
 - **`REBOOT` flushes filesystems first.** `ColdReboot()` resets instantly, and
