@@ -658,6 +658,7 @@ static void do_exec(const UBYTE *cmd, UWORD len, UWORD secs)
                                     current dir, which System() then hands on - without
                                     it the command saw only C: ("rx: Unknown command") */
                                  NP_Cli,       (Tag)TRUE,
+                                 NP_CommandName, (Tag)"netharness_exec",   /* not "C:netharness" in Status */
                                  TAG_DONE);
         if (proc) proc->pr_Task.tc_UserData = (APTR)j;
         Permit();
