@@ -146,7 +146,12 @@ nhctl.py EXEC 'rx "address IBROWSE; ''GOTOURL https://aminet.net''"'
 
 ## Getting started
 
-**On the Amiga** (needs a TCP/IP stack — Roadshow, AmiTCP, Miami, a314bsd…):
+**Requirements:** a 68020 or better (the release binary is built `-m68020`),
+AmigaOS 3.0 or newer (screen capture uses graphics.library V39), and any TCP/IP
+stack providing `bsdsocket.library` — Roadshow, AmiTCP, Miami, a314bsd…
+
+**On the Amiga**, double-click the `Install` icon in the NetHarness drawer, or
+from a Shell in that drawer:
 
 ```
 Execute Install
@@ -236,8 +241,11 @@ The binary carries a standard AmigaDOS version cookie:
 
 ```
 $ nhctl.py --host <ip> EXEC "version C:netharness full"
-netharness 1.4 (08/12/26)
+netharness 1.10 (30.9.2026)
 ```
+
+The 1.10.1 package carries the 1.10 binary, so it reports `1.10`: 1.10.1 only
+added the installer and drawer icons.
 
 ## Building
 
