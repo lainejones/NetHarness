@@ -7,9 +7,9 @@ thomas-luebker/amimcp, but on top of NetHarness's existing protocol (input ACKs,
 EXEC, the v1.3 semantic layer).
 
 Register it (Claude Code):
-    claude mcp add amiga -- python3 C:/projects/NetHarness/host/nhmcp.py --host 192.168.50.32
+    claude mcp add amiga -- python3 C:/projects/NetHarness/host/nhmcp.py --host 192.168.1.32
 
-Options:  --host <ip>   (default 192.168.50.32, the A4000)
+Options:  --host <ip>   (default: nhctl.py's DEFAULT_HOST)
           --port <n>    (default 7800)
 
 Only the standard library is used, except Pillow for screenshots (same as

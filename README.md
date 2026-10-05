@@ -78,6 +78,20 @@ a genuine click would.
   booting, WiFi rejoining, or the stack restarting - with no manual run needed
   at the machine.
 
+**New in 1.11:**
+
+- `EXEC` with a task priority: `nhctl.py --pri N EXEC ...` (-20..19). The
+  commands the harness starts used to run at priority 0, behind any
+  full-screen game that never waits; `--pri 5` gets a grab or a `Status` in
+  ahead of it.
+- `nhctl.py STATUS` and `WAITUP [secs]`: is the Amiga up, and wait until it
+  is (see "Is it up?" below).
+- `nhgui.py`: a window on the PC that shows the Amiga's front screen and
+  passes on clicks, drags, menu picks and typing (see below).
+- Screenshots and pointer positions are of the **front** screen - what the
+  monitor shows. Before, they were of the active screen: with a game's
+  screen active behind the Workbench the picture went on showing the game.
+
 **New in 1.10:**
 
 - `EXEC` can no longer wedge the harness: the command runs in a helper
@@ -296,11 +310,21 @@ The binary carries a standard AmigaDOS version cookie:
 
 ```
 $ nhctl.py --host <ip> EXEC "version C:netharness full"
-netharness 1.10 (30.9.2026)
+netharness 1.11 (5.10.2026)
 ```
 
-The 1.10.1 package carries the 1.10 binary, so it reports `1.10`: 1.10.1 only
-added the installer and drawer icons.
+(The 1.10.1 package carried the 1.10 binary: it only added the installer and
+drawer icons.)
+
+## What is in a release
+
+- `NetHarness-<version>.lha` - for the Amiga: the `NetHarness` drawer with the
+  harness, its installer and this README (and `nhctl.py`, for reference).
+- `NetHarness-<version>.zip` - the same drawer as a zip, for unpacking on a PC.
+- `NetHarness-<version>-PC.zip` - the PC side on its own: `nhctl.py`,
+  `nhgui.py` (+ `nhgui.cmd`), `test_nhgui.py`, `nhmcp.py`, this README and
+  the licence. It needs Python 3; the window also needs Tk and Pillow
+  (`pip install pillow`).
 
 ## Building
 
