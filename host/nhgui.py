@@ -10,8 +10,14 @@ Shows the Amiga's front screen and passes on what you do to it:
                    (click it first): letters, Return, Esc, Tab, Backspace,
                    Del, cursor keys, F1-F10, Help = F12
 
-Along the top: which Amiga (a name from the machines file, or host:port),
-Refresh, automatic refresh every few seconds, Status (is it up?), Reboot.
+Along the top: which Amiga - pick it by name from the list, or type a name,
+an address or host:port and press Return ("Name it..." keeps an address
+under a name); Refresh, automatic refresh every few seconds, Workbench (bring the Workbench
+screen to the front: left Amiga + N), Next screen (left Amiga + M), Status
+(is it up?), Reboot.
+
+It is a way to look in on an Amiga and work it now and then - a picture on
+request, not a live view; not a replacement for VNC or a remote desktop.
 Along the bottom: an AmigaDOS command to run (with a priority for it), and
 its output.
 
@@ -32,7 +38,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageTk
 
@@ -58,12 +64,25 @@ def load_machines():
         return {}
 
 
+def save_machines(machines):
+    data = {}
+    try:
+        with open(CONFIG, encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        pass
+    data['machines'] = machines
+    with open(CONFIG, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+
 class Remote:
     """What the window asks of one Amiga.  Every call opens its own short
     connection; `held` remembers a button that is down between calls."""
 
     def __init__(self, host, port):
         self.host, self.port = host, port
+        self.last = None             # (x, y, when) of the last button press
 
     def _nh(self, timeout=20):
         return nhctl.NetHarness(self.host, self.port, timeout=timeout)
@@ -113,8 +132,14 @@ class Remote:
     def press(self, x, y, b):
         nh = self._nh()
         try:
-            nh.move_to(x, y)
+            # The second click of a double-click: the pointer is still there.
+            # Sending it home and back first (move_to) took longer than the
+            # Amiga's double-click time on a real machine.
+            again = self.last and abs(self.last[0] - x) <= 2 and abs(self.last[1] - y) <= 2                 and time.time() - self.last[2] < 3
+            if not again:
+                nh.move_to(x, y)
             nh.button(b, True)
+            self.last = (x, y, time.time())
         finally:
             self._done(nh)
 
@@ -130,6 +155,7 @@ class Remote:
         try:
             if moved:
                 self._glide(nh, x, y)
+                self.last = None
             nh.button(b, False)
         finally:
             self._done(nh)
@@ -160,6 +186,16 @@ class Remote:
         finally:
             self._done(nh)
 
+    def amiga_key(self, code):
+        """left Amiga + a key: N = Workbench to front, M = next screen"""
+        nh = self._nh()
+        try:
+            nh.key(0x66, True)
+            nh.press_key(code)
+            nh.key(0x66, False)
+        finally:
+            self._done(nh)
+
     def reboot(self):
         nh = self._nh()
         try:
@@ -174,6 +210,7 @@ class App:
         self.machines = load_machines()
         self.remote = None
         self.jobs = queue.Queue()
+        self.results = queue.Queue()
         self.image = None            # the Amiga's screen, full size
         self.photo = None
         self.scale, self.ox, self.oy = 1.0, 0, 0
@@ -186,24 +223,29 @@ class App:
         self.shot_path = os.path.join(tempfile.gettempdir(), 'nhgui_shot.png')
 
         root.title('NetHarness')
-        root.geometry('900x760')
+        root.geometry("1060x800")
         top = ttk.Frame(root, padding=4)
         top.pack(fill='x')
         ttk.Label(top, text='Amiga').pack(side='left')
-        self.target = tk.StringVar(value=target or (next(iter(self.machines), '')))
-        self.combo = ttk.Combobox(top, textvariable=self.target, width=24,
-                                  values=list(self.machines))
+        # pick one by name from the list, or type a name, an address or
+        # host:port and press Return
+        self.target = tk.StringVar(value=self.entry_for(target) if target else
+                                   (self.entries()[0] if self.machines else ''))
+        self.combo = ttk.Combobox(top, textvariable=self.target, width=34, values=self.entries())
         self.combo.pack(side='left', padx=4)
         self.combo.bind('<<ComboboxSelected>>', lambda e: self.connect())
         self.combo.bind('<Return>', lambda e: self.connect())
+        ttk.Button(top, text='Name it...', width=9, command=self.name_it).pack(side='left')
         ttk.Button(top, text='Refresh', command=self.refresh).pack(side='left')
-        self.auto = tk.BooleanVar(value=False)
+        self.auto = tk.BooleanVar(value=True)
         ttk.Checkbutton(top, text='every', variable=self.auto,
                         command=self.auto_tick).pack(side='left', padx=(8, 0))
-        self.every = tk.StringVar(value='3')
+        self.every = tk.StringVar(value='5')
         ttk.Spinbox(top, from_=1, to=60, width=3, textvariable=self.every).pack(side='left')
         ttk.Label(top, text='s').pack(side='left')
-        ttk.Button(top, text='Status', command=self.status).pack(side='left', padx=(8, 0))
+        ttk.Button(top, text='Workbench', command=lambda: self.flip(0x36)).pack(side='left', padx=(8, 0))
+        ttk.Button(top, text='Next screen', command=lambda: self.flip(0x37)).pack(side='left', padx=4)
+        ttk.Button(top, text='Status', command=self.status).pack(side='left', padx=(4, 0))
         ttk.Button(top, text='Save picture', command=self.save).pack(side='left', padx=4)
         ttk.Button(top, text='Release keys', command=self.reset_input).pack(side='left')
         ttk.Button(top, text='Reboot', command=self.reboot).pack(side='right')
@@ -236,6 +278,9 @@ class App:
         self.statusbar.pack(fill='x')
 
         threading.Thread(target=self.worker, daemon=True).start()
+        self.poll()
+        root.bind('<FocusIn>', self.on_focus)
+        self.root.after(3000, self.auto_tick)
         if self.target.get():
             self.connect()
         else:
@@ -246,37 +291,93 @@ class App:
     def say(self, text):
         self.statusbar.config(text=text)
 
-    def connect(self):
-        t = self.machines.get(self.target.get().strip(), self.target.get().strip())
+    def entries(self):
+        return [f'{n}   ({a})' for n, a in self.machines.items()]
+
+    def entry_for(self, text):
+        return next((e for e in self.entries() if e.split('   (')[0].lower() == text.lower()), text)
+
+    def address(self):
+        """host, port from what the box says: "name   (host:port)", a name
+        (any unambiguous start of one), a host or host:port"""
+        t = self.target.get().strip()
+        if t.endswith(')') and '(' in t:
+            t = t[t.rindex('(') + 1:-1]
+        else:
+            hits = [a for n, a in self.machines.items() if n.lower().startswith(t.lower())]
+            exact = [a for n, a in self.machines.items() if n.lower() == t.lower()]
+            if exact or len(hits) == 1:
+                t = (exact or hits)[0]
         host, _, port = t.partition(':')
+        try:
+            return host.strip(), int(port or nhctl.DEFAULT_PORT)
+        except ValueError:
+            return '', 0
+
+    def connect(self):
+        host, port = self.address()
         if not host:
+            self.say('Pick an Amiga from the list, or type its name or address (host:port)')
             return
-        self.remote = Remote(host, int(port or nhctl.DEFAULT_PORT))
+        self.remote = Remote(host, port)
+        self.target.set(next((e for e in self.entries() if e.endswith(f'({host}:{port})')),
+                             f'{host}:{port}'))
+        self.root.title(f'NetHarness - {self.target.get().split("   (")[0]}')
         self.image = None
         self.draw()
         self.refresh()
+
+    def name_it(self):
+        """give the Amiga in the box a name and keep it in the machines file"""
+        host, port = self.address()
+        if not host:
+            self.say('Type the address (host:port) in the box first')
+            return
+        old = next((n for n, a in self.machines.items() if a == f'{host}:{port}'), '')
+        name = simpledialog.askstring('Name it', f'Name for {host}:{port}  (empty = forget it)',
+                                      initialvalue=old, parent=self.root)
+        if name is None:
+            return
+        if old:
+            del self.machines[old]
+        if name.strip():
+            self.machines[name.strip()] = f'{host}:{port}'
+        save_machines(self.machines)
+        self.combo.config(values=self.entries())
+        self.connect()
+
+    def on_focus(self, e):
+        if e.widget is self.root and self.remote and self.busy == 0 and self.held is None:
+            self.refresh(quiet=True)
 
     def submit(self, label, fn, then=None, quiet=False):
         """Run fn() on the worker thread, then then(result) here."""
         if not self.remote:
             self.say('No Amiga chosen')
             return
+        self.busy += 1
+        if not quiet:
+            self.say(label + '...')
         self.jobs.put((label, fn, then, quiet))
 
     def worker(self):
+        """The network side.  It never touches Tk: results go back through a
+        queue that the window's own thread empties (poll)."""
         while True:
             label, fn, then, quiet = self.jobs.get()
-            self.root.after(0, self._busy, +1, label, quiet)
             try:
                 res, err = fn(), None
             except Exception as e:  # noqa: BLE001 - every network failure ends up here
                 res, err = None, e
-            self.root.after(0, self._finished, label, then, res, err, quiet)
+            self.results.put((label, then, res, err, quiet))
 
-    def _busy(self, d, label, quiet):
-        self.busy += d
-        if d > 0 and not quiet:
-            self.say(label + '...')
+    def poll(self):
+        try:
+            while True:
+                self._finished(*self.results.get_nowait())
+        except queue.Empty:
+            pass
+        self.root.after(30, self.poll)
 
     def _finished(self, label, then, res, err, quiet):
         self.busy -= 1
@@ -370,9 +471,16 @@ class App:
             self.refresh_timer = None
         self.held = [b, p[0], p[1], False, p]
         r = self.remote
+        self.mark(e.x, e.y)
+        self.say(f'{("Left", "Right", "Middle")[b]} button at {p[0]}, {p[1]}')
         self.submit('Click', lambda: r.press(p[0], p[1], b), quiet=True)
         if b == 1:                                  # menus: show them once they are down
             self.later_refresh(350)
+
+    def mark(self, x, y):
+        """a ring where the click went (the Amiga's pointer is not in the picture)"""
+        ring = self.canvas.create_oval(x - 9, y - 9, x + 9, y + 9, outline='#ff3030', width=2)
+        self.root.after(700, lambda: self.canvas.delete(ring))
 
     def on_motion(self, e):
         p = self.to_amiga(e)
@@ -432,6 +540,11 @@ class App:
         self.submit('Status', lambda: nhctl.probe(r.host, r.port),
                     lambda res: self.say(f'{r.host}:{r.port}  {res[0].upper()}: {res[1]}'), quiet=True)
 
+    def flip(self, code):
+        r = self.remote
+        if r:
+            self.submit('Screen', lambda: r.amiga_key(code), lambda _: self.later_refresh(400), quiet=True)
+
     def save(self):
         if self.image is None:
             return
@@ -445,6 +558,11 @@ class App:
         r = self.remote
         self.held = None
         self.submit('Release keys', r.reset_input)
+
+    def unstick(self):
+        """a press whose release never came (the mouse left the window): let go"""
+        if self.held is not None and time.time() - self.held_at > 15:
+            self.reset_input()
 
     def reboot(self):
         r = self.remote

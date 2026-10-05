@@ -4,7 +4,7 @@
 Direct TCP client - no Pi middleman.  One command per invocation, or
 --batch to read newline-separated commands from stdin over one connection.
 
-  python3 nhctl.py [--host 192.168.50.32] [--port 7800] [--timeout SECS] [--pri N] COMMAND [args...]
+  python3 nhctl.py [--host 192.168.1.32] [--port 7800] [--timeout SECS] [--pri N] COMMAND [args...]
 
   --timeout SECS   limit for EXEC (default 120).  With a 1.10+ harness the
                    AMIGA enforces it: the command gets Ctrl-C and you get its

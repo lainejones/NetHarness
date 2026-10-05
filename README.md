@@ -190,12 +190,36 @@ one invocation each.
 
 ## A remote-control window (`nhgui.py`)
 
-`python nhgui.py [host[:port]]` (or double-click `nhgui.cmd` on Windows)
-opens a window that shows the Amiga's front screen and passes on what you do
-to it: click, double-click and drag with the left button; hold the right
-button and move to pull the menus down and pick an item; type while the
-picture has the focus. Along the top are Refresh, automatic refresh, Status
-and Reboot; along the bottom an AmigaDOS command line with its output.
+![nhgui showing a Workbench screen](docs/nhgui.png)
+
+`python nhgui.py [name | host[:port]]` (or double-click `nhgui.cmd` on
+Windows) opens a window that shows the Amiga's front screen and passes on
+what you do to it:
+
+- **left button** - click, double-click, drag (a red ring shows where the
+  click went: the Amiga's own pointer is a sprite and is not in the picture)
+- **right button** - hold it and move, as on the Amiga: the menus drop down,
+  the picture follows, release over an item to pick it
+- **keyboard** - click the picture, then type: letters, Return, Esc, Tab,
+  Backspace, Del, cursor keys, F1-F10 (F12 is Help)
+
+Along the top: which Amiga (pick it by name, or type a name or an address and
+press Return; "Name it..." keeps an address under a name), Refresh, automatic
+refresh every few seconds, Workbench (left Amiga + N), Next screen (left
+Amiga + M), Status, Save picture, Release keys, Reboot. Along the bottom: an
+AmigaDOS command line, a priority for the command, and its output.
+
+It is not a replacement for VNC or a remote desktop: there is no live view,
+just a fresh picture after each thing you do and every few seconds (about a
+quarter of a second for a 320x200 screen, two to three for 800x600 in true
+colour from a 68060). It is for looking in on an Amiga in another room and
+working it now and then - starting a program, answering a requester, seeing
+what a test left on the screen.
+
+`python test_nhgui.py host[:port] [x y]` drives the window's own mouse and
+keyboard handlers against a live Amiga (a double-click on the RAM Disk icon
+at x, y; a window drag; a menu pick with the right button; typing into a
+Shell) and checks the result on the Amiga.
 
 Each action is one short connection, so `nhctl.py` and scripts can use the
 same Amiga in between. Names for your machines go in `~/.nhgui.json`:

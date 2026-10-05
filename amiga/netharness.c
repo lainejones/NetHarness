@@ -491,8 +491,10 @@ static void do_screenshot_region(WORD x0, WORD y0, WORD rw, WORD rh)
     UWORD  y, i;
     UBYTE  hdr[8];
 
-    scr = IntuitionBase->ActiveScreen;
-    if (!scr) scr = IntuitionBase->FirstScreen;
+    /* the FRONT screen - what the monitor shows.  Up to 1.10 this was the
+     * active screen: with a game's screen active behind the Workbench (left
+     * Amiga + N) the picture went on showing the game. */
+    scr = IntuitionBase->FirstScreen;
     if (!scr) return;
 
     rp = &scr->RastPort;
@@ -767,9 +769,7 @@ static void do_hello(void)
 
 static struct Screen *front_screen(void)
 {
-    struct Screen *scr = IntuitionBase->ActiveScreen;
-    if (!scr) scr = IntuitionBase->FirstScreen;
-    return scr;
+    return IntuitionBase->FirstScreen;      /* frontmost: what the monitor shows */
 }
 
 /* Where IS the pointer?  The sprite never shows up in a screenshot, so without
