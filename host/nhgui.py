@@ -214,7 +214,10 @@ class App:
         self.image = None            # the Amiga's screen, full size
         self.photo = None
         self.scale, self.ox, self.oy = 1.0, 0, 0
-        self.held = None             # (button, start x, start y, moved)
+        self.held = None             # [button, start x, start y, moved, last x y, press canvas x y]
+        self.quiet_until = 0.0       # no picture is fetched before this time
+        self.last_click = None       # (amiga x, y, when, canvas x, y) of the last left press
+        self.second_timer = None
         self.pending_keys = []
         self.key_timer = None
         self.refresh_timer = None
@@ -222,7 +225,8 @@ class App:
         self.busy = 0
         self.shot_path = os.path.join(tempfile.gettempdir(), 'nhgui_shot.png')
 
-        root.title('NetHarness')
+        self.title = 'NetHarness'
+        root.title(self.title)
         root.geometry("1060x800")
         top = ttk.Frame(root, padding=4)
         top.pack(fill='x')
@@ -322,7 +326,8 @@ class App:
         self.remote = Remote(host, port)
         self.target.set(next((e for e in self.entries() if e.endswith(f'({host}:{port})')),
                              f'{host}:{port}'))
-        self.root.title(f'NetHarness - {self.target.get().split("   (")[0]}')
+        self.title = f'NetHarness - {self.target.get().split("   (")[0]}'
+        self.root.title(self.title)
         self.image = None
         self.draw()
         self.refresh()
@@ -358,6 +363,15 @@ class App:
         self.busy += 1
         if not quiet:
             self.say(label + '...')
+        if label != 'Picture':
+            # a click must not wait behind pictures that have not started
+            # yet (a picture of a big screen takes seconds, and the second
+            # click of a double-click has to follow the first at once)
+            with self.jobs.mutex:
+                waiting = [j for j in self.jobs.queue if j[0] == 'Picture']
+                for j in waiting:
+                    self.jobs.queue.remove(j)
+                self.busy -= len(waiting)
         self.jobs.put((label, fn, then, quiet))
 
     def worker(self):
@@ -385,6 +399,7 @@ class App:
             what = 'no answer in time' if isinstance(err, (TimeoutError, OSError)) and \
                 'timed out' in str(err).lower() else str(err)
             self.say(f'{label}: {what}  (Status tells you more)')
+            self.root.title(self.title)
             return
         if not quiet:
             self.say(label + ': done')
@@ -396,7 +411,11 @@ class App:
     def refresh(self, quiet=False):
         if self.jobs.qsize() > 2:
             return
+        if time.time() < self.quiet_until:        # a click just went: its partner may follow
+            self.later_refresh(int((self.quiet_until - time.time()) * 1000) + 50)
+            return
         r, path = self.remote, self.shot_path
+        self.root.title(self.title + '   (fetching the picture...)')
         self.submit('Picture', lambda: r.shot(path), self.got_shot, quiet)
 
     def got_shot(self, res):
@@ -407,6 +426,7 @@ class App:
         except OSError as e:
             self.say(f'Picture: {e}')
             return
+        self.root.title(self.title)
         colours = 'true colour' if d == 24 else f'{d} colours' if d > 8 else f'{1 << d} colours'
         self.say(f'{self.remote.host}:{self.remote.port}   {w} x {h}, {colours}   '
                  f'{time.strftime("%H:%M:%S")}')
@@ -448,6 +468,11 @@ class App:
         self.refresh_timer = None
         self.refresh(quiet=True)
 
+    def _second(self):
+        self.second_timer = None
+        if self.held is None:
+            self.refresh(quiet=True)
+
     def auto_tick(self):
         if not self.auto.get():
             return
@@ -466,10 +491,15 @@ class App:
         p = self.to_amiga(e)
         if p is None or self.held is not None:
             return
+        last = self.last_click
+        if b == 0 and last and time.time() - last[2] < 1.0 and \
+                abs(e.x - last[3]) + abs(e.y - last[4]) <= 10:
+            p = (last[0], last[1])                  # same spot as the first click
+        self.last_click = (p[0], p[1], time.time(), e.x, e.y) if b == 0 else None
         if self.refresh_timer:                      # a second click of a double-click:
             self.root.after_cancel(self.refresh_timer)   # no picture in between
             self.refresh_timer = None
-        self.held = [b, p[0], p[1], False, p]
+        self.held = [b, p[0], p[1], False, p, (e.x, e.y)]
         r = self.remote
         self.mark(e.x, e.y)
         self.say(f'{("Left", "Right", "Middle")[b]} button at {p[0]}, {p[1]}')
@@ -486,7 +516,11 @@ class App:
         p = self.to_amiga(e)
         if p is None or self.held is None:
             return
-        if abs(p[0] - self.held[1]) + abs(p[1] - self.held[2]) > 2:
+        # the hand moves a little during any click: it is a drag only once the
+        # mouse has gone a clear distance on OUR screen (with the right
+        # button, any movement: that is how a menu is walked)
+        cx, cy = self.held[5]
+        if abs(e.x - cx) + abs(e.y - cy) > (2 if self.held[0] == 1 else 8):
             self.held[3] = True
         self.held[4] = p
         if self.drag_timer is None:                 # follow, but not every pixel
@@ -504,12 +538,20 @@ class App:
     def on_release(self, e, b):
         if self.held is None or self.held[0] != b:
             return
-        p = self.to_amiga(e) or self.held[4]
         moved = self.held[3]
+        # not a drag: let go exactly where the button went down
+        p = (self.to_amiga(e) or self.held[4]) if moved else (self.held[1], self.held[2])
         self.held = None
         r = self.remote
         self.submit('Click', lambda: r.release(p[0], p[1], b, moved), quiet=True)
-        self.later_refresh(650)                     # room for a double-click first
+        self.quiet_until = time.time() + 0.9        # room for a double-click first
+        self.later_refresh(950)
+        # ...and once more when a program that was started has had time to open
+        if self.second_timer:
+            self.root.after_cancel(self.second_timer)
+        self.second_timer = self.root.after(4000, self._second)
+        self.say('%s sent to the Amiga - the picture follows in a moment (a program takes a few '
+                 'seconds to open)' % ('Drag' if moved else 'Click'))
 
     # ---- keyboard ------------------------------------------------------------
 
