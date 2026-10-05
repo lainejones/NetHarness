@@ -40,6 +40,11 @@
  *       time limit, 0 = none; on timeout the command gets Ctrl-C, and the
  *       reply's rc is -2 with a note after its output)
  *     CMD_HELLO        = 20  payload: none  -> RESP_TEXT "netharness <ver> <port> <path>"
+ *   v1.11 addition:
+ *     CMD_EXEC_P       = 21  payload: pri1 secs2 len2 cmdline[len]  (EXEC_T with
+ *       a task priority for the command, -20..19: a full-screen game that
+ *       never waits shares the processor with priority 0 and a screen grab
+ *       started at 0 took minutes; started at 5 it is done at once)
  *       (an older harness drops the unknown byte, so a client can send HELLO
  *       then PING and tell from the replies whether EXEC_T is understood)
  *     CMD_RELOAD       = 18  payload: none  (apply a staged
@@ -105,8 +110,8 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.10"
-#define NH_VERDATE "30.9.2026"
+#define NH_VERSION "1.11"
+#define NH_VERDATE "5.10.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
 
@@ -129,6 +134,7 @@ static const char verstag[] __attribute__((used)) =
 #define CMD_PUTFILE      17
 #define CMD_RELOAD       18
 #define CMD_EXEC_T       19
+#define CMD_EXEC_P       21
 #define CMD_HELLO        20
 
 #define RESP_SCREENSHOT_HDR 0x81
@@ -590,6 +596,7 @@ struct ExecJob {
     LONG          sig;
     volatile LONG rc;
     volatile UBYTE done, abandoned;
+    BYTE          pri;
     char          cmd[EXEC_CMD_MAX + 1];
     char          out[32];
     char          name[24];
@@ -610,7 +617,7 @@ static void exec_worker(void)
                         SYS_Input,    (Tag)in,
                         SYS_Output,   (Tag)out,
                         NP_Name,      (Tag)j->name,
-                        NP_Priority,  (Tag)0,
+                        NP_Priority,  (Tag)(LONG)j->pri,
                         NP_WindowPtr, (Tag)-1L,   /* no DOS requesters - see main() */
                         TAG_DONE);
         Close(out);
@@ -626,7 +633,7 @@ static void exec_worker(void)
        could exit and unload the code we are running */
 }
 
-static void do_exec(const UBYTE *cmd, UWORD len, UWORD secs)
+static void do_exec(const UBYTE *cmd, UWORD len, UWORD secs, BYTE pri)
 {
     struct ExecJob *j;
     struct Process *proc = NULL;
@@ -646,6 +653,7 @@ static void do_exec(const UBYTE *cmd, UWORD len, UWORD secs)
         j->cmd[len] = 0;
         j->parent = FindTask(NULL);
         j->sig = sig;
+        j->pri = pri < -20 ? -20 : pri > 19 ? 19 : pri;   /* never above the harness itself */
         g_jobno++;
         sprintf(j->out, EXEC_OUT_FMT, (unsigned long)g_jobno);
         sprintf(j->name, "nh_exec %lu", (unsigned long)g_jobno);
@@ -1359,7 +1367,7 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
                 UWORD clen = (UWORD)((b[1] << 8) | b[2]);
                 if (3L + clen > CMDBUF_SIZE) return -1;
                 if ((LONG)avail < 3L + clen) return 0;
-                do_exec(b + 3, clen, EXEC_DEFAULT_SECS);
+                do_exec(b + 3, clen, EXEC_DEFAULT_SECS, 0);
                 return (WORD)(3 + clen);
             }
         case CMD_EXEC_T:
@@ -1369,8 +1377,18 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
                 UWORD clen = (UWORD)((b[3] << 8) | b[4]);
                 if (5L + clen > CMDBUF_SIZE) return -1;
                 if ((LONG)avail < 5L + clen) return 0;
-                do_exec(b + 5, clen, secs);
+                do_exec(b + 5, clen, secs, 0);
                 return (WORD)(5 + clen);
+            }
+        case CMD_EXEC_P:
+            if (avail < 6) return 0;
+            {
+                UWORD secs = (UWORD)((b[2] << 8) | b[3]);
+                UWORD clen = (UWORD)((b[4] << 8) | b[5]);
+                if (6L + clen > CMDBUF_SIZE) return -1;
+                if ((LONG)avail < 6L + clen) return 0;
+                do_exec(b + 6, clen, secs, (BYTE)b[1]);
+                return (WORD)(6 + clen);
             }
         case CMD_HELLO:
             do_hello();

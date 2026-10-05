@@ -4,12 +4,24 @@
 Direct TCP client - no Pi middleman.  One command per invocation, or
 --batch to read newline-separated commands from stdin over one connection.
 
-  python3 nhctl.py [--host 192.168.50.32] [--port 7800] [--timeout SECS] COMMAND [args...]
+  python3 nhctl.py [--host 192.168.50.32] [--port 7800] [--timeout SECS] [--pri N] COMMAND [args...]
 
   --timeout SECS   limit for EXEC (default 120).  With a 1.10+ harness the
                    AMIGA enforces it: the command gets Ctrl-C and you get its
                    output so far with rc=-2 - the harness stays usable.  An
                    older harness only drops the connection on our side.
+
+  --pri N          task priority for the EXEC'd command, -20..19 (1.11+).  A
+                   full-screen game that never waits shares the processor with
+                   everything at priority 0; a grab or a Status started with
+                   --pri 5 gets in ahead of it.
+
+  STATUS                    is the Amiga up?  Tells apart: nothing listening /
+                            connected but silent / answering (with version and
+                            front screen).  Exit code 0 only when it answers.
+                            (A ping proves nothing: an A4000's ZZ9000 goes on
+                            answering pings at the insert-disk screen.)
+  WAITUP [secs]             wait until it answers (default 180 s), e.g. after REBOOT
 
 Commands (same verbs as the A314 harness ctl.py, plus EXEC):
   PING                      liveness check (waits for the Amiga's ack)
@@ -69,6 +81,7 @@ CMD_POINTER, CMD_UITREE, CMD_MENUS, CMD_SCREENS = 10, 11, 12, 13
 CMD_REGION_SUM, CMD_SHOT_REGION, CMD_GETFILE, CMD_PUTFILE = 14, 15, 16, 17
 CMD_RELOAD = 18
 CMD_EXEC_T, CMD_HELLO = 19, 20          # v1.10
+CMD_EXEC_P = 21                         # v1.11
 RESP_TEXT = 0x85
 EXEC_TIMED_OUT = -2
 RESP_SCREENSHOT_HDR, RESP_ACK, RESP_EXEC = 0x81, 0x82, 0x83
@@ -134,14 +147,20 @@ class NetHarness:
                 raise ConnectionError(f'expected ACK after HELLO, got 0x{b[0]:02x}')
         return self._version
 
-    def has_exec_timeout(self):
+    def _at_least(self, major, minor):
         v = self.version()
         if not v:
             return False
         try:
-            return tuple(int(x) for x in v.split('.')[:2]) >= (1, 10)
+            return tuple(int(x) for x in v.split('.')[:2]) >= (major, minor)
         except ValueError:
             return False
+
+    def has_exec_timeout(self):
+        return self._at_least(1, 10)
+
+    def has_exec_pri(self):
+        return self._at_least(1, 11)
 
     # ---- low level -------------------------------------------------------
 
@@ -516,11 +535,17 @@ class NetHarness:
 
     # ---- EXEC ------------------------------------------------------------------
 
-    def exec_cmd(self, cmdline, timeout=120):
+    def exec_cmd(self, cmdline, timeout=120, pri=0):
         """Run an AmigaDOS command; returns (rc, output).  rc == EXEC_TIMED_OUT
-        (-2): a 1.10+ harness stopped it after `timeout` seconds."""
+        (-2): a 1.10+ harness stopped it after `timeout` seconds.  pri: the
+        command's task priority (1.11+; an older harness runs it at 0)."""
         data = cmdline.encode('latin-1')
-        if self.has_exec_timeout():
+        if pri and self.has_exec_pri():
+            secs = max(1, min(int(timeout), 65535))
+            self.sock.settimeout(secs + 30)
+            self.sock.sendall(bytes([CMD_EXEC_P]) + struct.pack('>bHH', max(-20, min(19, int(pri))),
+                                                                 secs, len(data)) + data)
+        elif self.has_exec_timeout():
             secs = max(1, min(int(timeout), 65535))
             self.sock.settimeout(secs + 30)   # the Amiga answers by secs + its 5s grace
             self.sock.sendall(bytes([CMD_EXEC_T]) + struct.pack('>HH', secs, len(data)) + data)
@@ -540,6 +565,56 @@ class NetHarness:
 
 
 EXEC_TIMEOUT = 120
+EXEC_PRI = 0
+
+
+def probe(host, port, wait=6.0):
+    """One look at the harness -> (state, detail).  state is 'up', 'silent'
+    (it accepted the connection and then said nothing: busy with a command
+    that has taken the machine over, or frozen), 'closed' (nothing listening:
+    the Amiga is booting, the harness is not started, or the TCP stack is not
+    up) or 'unreachable' (no answer at all: off, crashed, or no network)."""
+    try:
+        sock = socket.create_connection((host, port), timeout=wait)
+    except ConnectionRefusedError:
+        return 'closed', 'nothing is listening on the port'
+    except (socket.timeout, TimeoutError):
+        return 'unreachable', 'no answer to the connection attempt'
+    except OSError as e:
+        return 'unreachable', str(e)
+    nh = NetHarness.__new__(NetHarness)
+    nh.sock, nh._version, nh.prog_path = sock, False, None
+    sock.settimeout(wait)
+    try:
+        v = nh.version()
+        scr = nh.screens().strip().splitlines()
+        front = scr[0] if scr else '(no screen)'
+        return 'up', f'netharness {v or "older than 1.10"}; front screen: {front}'
+    except (socket.timeout, TimeoutError):
+        return 'silent', 'connected, but no reply'
+    except (ConnectionError, OSError) as e:
+        return 'silent', f'connected, then: {e}'
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def wait_up(host, port, secs=180, quiet=False):
+    """Poll until the harness answers; returns True/False.  Needs two good
+    answers a few seconds apart: a machine on its way down still answers once."""
+    start, good, last = time.time(), 0, None
+    while time.time() - start < secs:
+        state, detail = probe(host, port, wait=5.0)
+        if state != last and not quiet:
+            print(f'  {int(time.time() - start):3d} s: {state} - {detail}', flush=True)
+            last = state
+        good = good + 1 if state == 'up' else 0
+        if good >= 2:
+            return True
+        time.sleep(3)
+    return False
 
 
 def run_command(nh, argv):
@@ -622,7 +697,9 @@ def run_command(nh, argv):
     elif cmd == 'PUTFILE':
         n = nh.put_file(args[0], args[1]); print(f'OK put {n} bytes -> {args[1]}')
     elif cmd == 'EXEC':
-        rc, out = nh.exec_cmd(' '.join(args), EXEC_TIMEOUT)
+        if EXEC_PRI and not nh.has_exec_pri():
+            print('(--pri needs a 1.11+ harness: running at priority 0)', file=sys.stderr)
+        rc, out = nh.exec_cmd(' '.join(args), EXEC_TIMEOUT, EXEC_PRI)
         print('rc=TIMEOUT' if rc == EXEC_TIMED_OUT else f'rc={rc}')
         if out:
             print(out, end='' if out.endswith('\n') else '\n')
@@ -671,6 +748,9 @@ def main():
         elif argv[0] == '--timeout':
             global EXEC_TIMEOUT
             EXEC_TIMEOUT = int(argv[1]); argv = argv[2:]
+        elif argv[0] == '--pri':
+            global EXEC_PRI
+            EXEC_PRI = int(argv[1]); argv = argv[2:]
         elif argv[0] == '--batch':
             argv = argv[1:]
             nh = NetHarness(host, port)
@@ -689,6 +769,15 @@ def main():
     if not argv:
         print(__doc__)
         return 1
+    if argv[0].upper() == 'STATUS':
+        state, detail = probe(host, port)
+        print(f'{state.upper()}: {detail}')
+        return 0 if state == 'up' else 3
+    if argv[0].upper() == 'WAITUP':
+        secs = int(argv[1]) if len(argv) > 1 else 180
+        ok = wait_up(host, port, secs)
+        print('UP' if ok else f'NOT UP after {secs} s')
+        return 0 if ok else 3
     try:
         nh = NetHarness(host, port)
         return run_command(nh, argv)

@@ -188,6 +188,37 @@ python3 nhctl.py --host <amiga-ip> --batch < commands.txt
 `--batch` sends many commands over one connection, which is much quicker than
 one invocation each.
 
+## A remote-control window (`nhgui.py`)
+
+`python nhgui.py [host[:port]]` (or double-click `nhgui.cmd` on Windows)
+opens a window that shows the Amiga's front screen and passes on what you do
+to it: click, double-click and drag with the left button; hold the right
+button and move to pull the menus down and pick an item; type while the
+picture has the focus. Along the top are Refresh, automatic refresh, Status
+and Reboot; along the bottom an AmigaDOS command line with its output.
+
+Each action is one short connection, so `nhctl.py` and scripts can use the
+same Amiga in between. Names for your machines go in `~/.nhgui.json`:
+
+```json
+{"machines": {"A4000": "192.168.1.32:7800", "A1200": "192.168.1.33:7800"}}
+```
+
+It needs Python 3 with Tk and Pillow.
+
+## Is it up? (`STATUS`, `WAITUP`) - 1.11
+
+`nhctl.py STATUS` tells apart the three things a silent Amiga can be:
+nothing listening on the port (booting, harness not started), connected but
+no reply (busy with a command that has taken the machine over, or frozen)
+and unreachable. `WAITUP [secs]` waits for it to answer, e.g. after `REBOOT`.
+A ping is no substitute: a network card with its own processor can go on
+answering pings while AmigaOS sits at the insert-disk screen.
+
+`--pri N` (harness 1.11+) gives the `EXEC`'d command a task priority. A
+full-screen game that never waits shares the processor with everything at
+priority 0; `--pri 5 EXEC ...` gets a command in ahead of it.
+
 ## Screenshots
 
 Screen capture handles the awkward cases real Amigas actually present:
