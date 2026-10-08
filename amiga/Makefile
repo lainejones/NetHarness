@@ -20,12 +20,12 @@ clean:
 #     LhA -r a NetHarness-<version>.lha NetHarness NetHarness.info
 # VERSION is the package version; the binary's own version is NH_VERSION in
 # netharness.c.
-VERSION  = 1.11
+VERSION  = 1.12
 DISTFILE = NetHarness-$(VERSION)
 
 # "make dist" leaves, in ../dist:
 #   NetHarness-<v>.zip      the Amiga drawer (binary, installer, README, nhctl.py)
-#   NetHarness-<v>-PC.zip   the PC side: nhctl.py, nhgui.py (+ .cmd), test_nhgui.py, nhmcp.py
+#   NetHarness-<v>-PC.zip   the PC side: nhctl.py, nhgui.py (+ .cmd), the two tests, nhmcp.py
 #   stage/                  the Amiga drawer unpacked, to pack with LhA on an Amiga
 dist: netharness
 	rm -rf ../dist/stage ../dist/$(DISTFILE).zip ../dist/$(DISTFILE)-PC.zip
@@ -36,7 +36,7 @@ dist: netharness
 	@# the drawer's own icon goes BESIDE it, or the unpacked drawer is invisible on Workbench
 	cp ../drawer.info ../dist/stage/NetHarness.info
 	cd ../dist/stage && python3 -m zipfile -c ../$(DISTFILE).zip NetHarness NetHarness.info
-	cp ../host/nhctl.py ../host/nhgui.py ../host/nhgui.cmd ../host/test_nhgui.py ../host/nhmcp.py \
+	cp ../host/nhctl.py ../host/nhgui.py ../host/nhgui.cmd ../host/test_nhgui.py ../host/test_dblclick.py ../host/nhmcp.py \
 	   ../README.md ../LICENSE ../dist/stage-pc/NetHarness-PC/
 	cp ../docs/nhgui.png ../dist/stage-pc/NetHarness-PC/docs/
 	cd ../dist/stage-pc && python3 -m zipfile -c ../$(DISTFILE)-PC.zip NetHarness-PC

@@ -78,6 +78,23 @@ a genuine click would.
   booting, WiFi rejoining, or the stack restarting - with no manual run needed
   at the machine.
 
+**New in 1.12** (the PC window only - the Amiga program is unchanged and still
+reports 1.11):
+
+- A click in `nhgui.py` is sent at once, ahead of any picture still being
+  fetched, and the window waits a moment before fetching the next one so that
+  a double-click is not split by a picture in between. Clicks felt hit-and-miss
+  on a real A4000 before: they queued behind slow pictures.
+- The status line says "Click sent..." when a click goes out, and a second
+  picture follows a few seconds later, when a program it started has had time
+  to open its window.
+- The second click of a double-click goes straight out, without moving the
+  pointer first: moving it took long enough on a 68060 for Workbench to see
+  two single clicks.
+- `test_dblclick.py` double-clicks the way a hand does - uneven gaps, a few
+  pixels of wobble, at any moment of the refresh - and counts how many open
+  the drawer.
+
 **New in 1.11:**
 
 - `EXEC` with a task priority: `nhctl.py --pri N EXEC ...` (-20..19). The
@@ -313,8 +330,9 @@ $ nhctl.py --host <ip> EXEC "version C:netharness full"
 netharness 1.11 (5.10.2026)
 ```
 
-(The 1.10.1 package carried the 1.10 binary: it only added the installer and
-drawer icons.)
+(The 1.12 package carries the 1.11 binary: only the PC window changed. The
+1.10.1 package carried the 1.10 binary: it only added the installer and drawer
+icons.)
 
 ## What is in a release
 
@@ -322,7 +340,7 @@ drawer icons.)
   harness, its installer and this README (and `nhctl.py`, for reference).
 - `NetHarness-<version>.zip` - the same drawer as a zip, for unpacking on a PC.
 - `NetHarness-<version>-PC.zip` - the PC side on its own: `nhctl.py`,
-  `nhgui.py` (+ `nhgui.cmd`), `test_nhgui.py`, `nhmcp.py`, this README and
+  `nhgui.py` (+ `nhgui.cmd`), `test_nhgui.py`, `test_dblclick.py`, `nhmcp.py`, this README and
   the licence. It needs Python 3; the window also needs Tk and Pillow
   (`pip install pillow`).
 
