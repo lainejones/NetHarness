@@ -34,49 +34,7 @@ Input is injected through `input.device` (`IND_WRITEEVENT`), the same path real
 hardware uses, so it exercises window activation, GadTools, menus — everything
 a genuine click would.
 
-### New in 1.3 — stop guessing pixels
-
-| Command | |
-|---|---|
-| `UITREE` | The front screen's windows and gadgets: id, kind, bounds, label, string contents |
-| `UICLICK <text>` / `UICLICKID <id>` | Click a gadget **by identity**, not coordinates |
-| `MENUS` / `MENUSEL <menu> <item>` | Enumerate the menu strip; pick an item **by name** |
-| `POINTER` | Where the pointer actually is (it's a hardware sprite — invisible in screenshots) |
-| `SHOTREGION x y w h` | Capture just a region — far cheaper than a full frame |
-| `REGIONSUM x y w h` | 4-byte checksum: "has this redrawn yet?" |
-| `WAITCHANGE x y w h` | Block until a region actually changes, instead of guessing a delay |
-| `GETFILE` / `PUTFILE` | Binary-safe file transfer — deploy a build through the harness itself |
-| `SCREENS` | List open screens, front to back |
-| `netharness [port]` | Listen port is an argument, so a new build can be tested beside the running one |
-
-**New in 1.4:**
-
-| Command | |
-|---|---|
-| `RELOAD` | Apply a staged `C:netharness.new` and **restart the harness in place - no machine reboot** |
-
-**New in 1.5:**
-
-- Plays fair with the TCP/IP stack's own shutdown: the harness blocks in
-  `WaitSelect` on socket **and** break signal, so a stack shutdown (Roadshow's
-  `NetShutdown`) sees it release `bsdsocket.library` immediately instead of
-  timing out against a blocked `accept()`/`recv()` and deferring the teardown.
-
-**New in 1.6:**
-
-- Send-stall guard: a controller that vanishes mid-transfer no longer freezes
-  the harness in a blocking `send()` - every send waits for writability first
-  (20 s cap), then the dead client is dropped.
-- Idle-client reaper: a silent client is disconnected after 600 s, so a
-  controller that died without closing can't hold the single client slot.
-
-**New in 1.7:**
-
-- Bring-up retries forever instead of giving up after 60 s: 2 s apart for the
-  first minute, then every 10 s (CTRL-C aborts the wait). The harness now
-  self-connects whenever its network path appears late - a companion Pi still
-  booting, WiFi rejoining, or the stack restarting - with no manual run needed
-  at the machine.
+## What's new (newest first)
 
 **New in 1.12** (the PC window only - the Amiga program is unchanged and still
 reports 1.11):
@@ -146,6 +104,50 @@ reports 1.11):
 - Length-field hardening: a GETFILE/PUTFILE/EXEC length too big for the
   command buffer now drops the client instead of wrapping negative and walking
   the parser out of its buffer (stray bytes could run as commands).
+
+**New in 1.7:**
+
+- Bring-up retries forever instead of giving up after 60 s: 2 s apart for the
+  first minute, then every 10 s (CTRL-C aborts the wait). The harness now
+  self-connects whenever its network path appears late - a companion Pi still
+  booting, WiFi rejoining, or the stack restarting - with no manual run needed
+  at the machine.
+
+**New in 1.6:**
+
+- Send-stall guard: a controller that vanishes mid-transfer no longer freezes
+  the harness in a blocking `send()` - every send waits for writability first
+  (20 s cap), then the dead client is dropped.
+- Idle-client reaper: a silent client is disconnected after 600 s, so a
+  controller that died without closing can't hold the single client slot.
+
+**New in 1.5:**
+
+- Plays fair with the TCP/IP stack's own shutdown: the harness blocks in
+  `WaitSelect` on socket **and** break signal, so a stack shutdown (Roadshow's
+  `NetShutdown`) sees it release `bsdsocket.library` immediately instead of
+  timing out against a blocked `accept()`/`recv()` and deferring the teardown.
+
+**New in 1.4:**
+
+| Command | |
+|---|---|
+| `RELOAD` | Apply a staged `C:netharness.new` and **restart the harness in place - no machine reboot** |
+
+**New in 1.3** — stop guessing pixels:
+
+| Command | |
+|---|---|
+| `UITREE` | The front screen's windows and gadgets: id, kind, bounds, label, string contents |
+| `UICLICK <text>` / `UICLICKID <id>` | Click a gadget **by identity**, not coordinates |
+| `MENUS` / `MENUSEL <menu> <item>` | Enumerate the menu strip; pick an item **by name** |
+| `POINTER` | Where the pointer actually is (it's a hardware sprite — invisible in screenshots) |
+| `SHOTREGION x y w h` | Capture just a region — far cheaper than a full frame |
+| `REGIONSUM x y w h` | 4-byte checksum: "has this redrawn yet?" |
+| `WAITCHANGE x y w h` | Block until a region actually changes, instead of guessing a delay |
+| `GETFILE` / `PUTFILE` | Binary-safe file transfer — deploy a build through the harness itself |
+| `SCREENS` | List open screens, front to back |
+| `netharness [port]` | Listen port is an argument, so a new build can be tested beside the running one |
 
 `UITREE` + `UICLICK` are the headline: drive the GUI by *what things are*.
 
