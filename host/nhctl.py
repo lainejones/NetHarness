@@ -790,5 +790,18 @@ def main():
         return 3
 
 
+def _watchdog():
+    """A last resort for scripted use: whatever blocks (a connection the
+    relay accepted but nobody serves, a reply that never comes), this
+    process ends by itself after the EXEC limit plus a margin, so a caller
+    waiting on its output is never held for good."""
+    import os, threading
+    limit = (int(sys.argv[sys.argv.index('--timeout') + 1]) + 90) if '--timeout' in sys.argv else 600
+    t = threading.Timer(limit, lambda: (sys.stderr.write('nhctl: gave up after %d s\n' % limit), os._exit(3)))
+    t.daemon = True
+    t.start()
+
+
 if __name__ == '__main__':
+    _watchdog()
     sys.exit(main())
