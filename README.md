@@ -36,6 +36,16 @@ a genuine click would.
 
 ## What's new (newest first)
 
+**New in 1.13** (the Amiga program):
+
+- The harness survives its TCP/IP stack going away. When the stack's errors
+  say it is gone (ENETDOWN and the like - a stack whose core crashed, or one
+  stopped without telling its clients), the harness closes its sockets and
+  bsdsocket.library and waits for the stack to come back, as it does at boot.
+  Before, a failing WaitSelect() was retried at once, forever, at priority
+  20: the mouse still moved but the harness never answered again, and the
+  machine needed a reboot. Ctrl-C still ends the harness.
+
 **New in 1.12** (the PC window only - the Amiga program is unchanged and still
 reports 1.11):
 

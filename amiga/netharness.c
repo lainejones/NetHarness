@@ -110,8 +110,8 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.11"
-#define NH_VERDATE "5.10.2026"
+#define NH_VERSION "1.13"
+#define NH_VERDATE "16.10.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
 
@@ -228,6 +228,22 @@ static UWORD g_port   = LISTEN_PORT;   /* overridable: `netharness 7801` */
 static LONG g_client = -1;          /* accepted client socket, -1 = none */
 static LONG g_listen = -1;          /* listening socket (RELOAD frees it) */
 static WORD g_shutdown = 0;         /* stack is going away: close up and exit */
+static WORD g_stack_lost = 0;       /* 1.13: the stack under us died - start over */
+
+/* 1.13: errors that mean the TCP/IP stack itself is gone (its core task
+ * exited, or it was stopped without telling its clients), not a bad client.
+ * Before 1.13 a failing WaitSelect() was retried at once, forever, at
+ * priority 20: the machine kept moving its mouse but the harness was deaf
+ * until a reboot (seen on the CD32 when PrismNet's core crashed). */
+#define NH_ENETDOWN 50
+#define NH_ENETUNREACH 51
+#define NH_EBADF 9
+#define NH_ENOTSOCK 38
+
+static BOOL stack_gone(LONG err)
+{
+    return err == NH_ENETDOWN || err == NH_EBADF || err == NH_ENOTSOCK;
+}
 
 /* Note: the bsdsocket protos spell the select timeout "struct __timeval", but
  * this NDK maps that straight onto the Amiga "struct timeval" from
@@ -268,6 +284,8 @@ static WORD wait_readable(LONG sock)
     if (rc < 0) {
         /* EINTR or a transient error - only bail out if a break really is set */
         if (CheckSignal(SIGBREAKF_CTRL_C)) return -1;
+        if (stack_gone(Errno())) { g_stack_lost = 1; return -2; }
+        Delay(10);                  /* never spin at our priority */
         return 0;
     }
     if (rc == 0) return 0;          /* timed out */
@@ -1565,6 +1583,7 @@ int main(int argc, char **argv)
         goto cleanup_libs;
     }
 
+bring_up:
     for (i = 0; ; i++) {
         if (server_up()) break;
         if (CheckSignal(SIGBREAKF_CTRL_C)) {
@@ -1581,6 +1600,7 @@ int main(int argc, char **argv)
     }
     printf("netharness: listening on port %d\n", (int)g_port);
     nh_log("netharness " NH_VERSION " listening on port", (LONG)g_port);
+    g_stack_lost = 0;
 
     for (;;) {
         UBYTE peer[16];
@@ -1602,12 +1622,15 @@ int main(int argc, char **argv)
          * NetShutdown time out and defer its teardown. */
         {
             WORD w = wait_readable(g_listen);
+            if (w == -2) break;         /* stack gone: start over below */
             if (w < 0) { nh_log("shutdown requested: exiting", 0); g_shutdown = 1; break; }
             if (w == 0) continue;       /* nothing pending - re-check signals */
         }
         g_client = accept(g_listen, (struct sockaddr *)peer, &peerlen);
         if (g_client < 0) {
-            nh_log("accept failed, errno", Errno());
+            LONG e = Errno();
+            nh_log("accept failed, errno", e);
+            if (stack_gone(e)) { g_stack_lost = 1; break; }
             if (CheckSignal(SIGBREAKF_CTRL_C)) { nh_log("CTRL-C: exiting", 0); break; }
             Delay(50);   /* 1s */
             continue;
@@ -1631,6 +1654,7 @@ int main(int argc, char **argv)
              * hold bsdsocket open across a shutdown request. */
             {
                 WORD w = wait_readable(g_client);
+                if (w == -2) break;     /* stack gone */
                 if (w < 0) { nh_log("shutdown requested: dropping client", 0); g_shutdown = 1; break; }
                 if (w == 0) {
                     /* idle-client reaper: a controller that died without a
@@ -1651,6 +1675,7 @@ int main(int argc, char **argv)
                 if (room > (LONG)sizeof(readbuf)) room = sizeof(readbuf);
                 n = recv(g_client, (APTR)readbuf, room, 0);
             }
+            if (n < 0 && stack_gone(Errno())) { g_stack_lost = 1; break; }
             if (n <= 0) break;    /* client gone */
             if (g_reload) break;  /* handed off to the replacement */
 
@@ -1686,7 +1711,20 @@ int main(int argc, char **argv)
         g_client = -1;
         if (g_reload) break;          /* replacement is taking over; exit */
         if (g_shutdown) break;        /* stack going away; release it promptly */
+        if (g_stack_lost) break;
         /* loop back to accept() for the next controller connection */
+    }
+
+    /* 1.13: the stack died under us - let go of it completely and wait for
+     * it to come back, exactly as at boot. */
+    if (g_stack_lost && !g_reload && !g_shutdown) {
+        printf("netharness: network stack lost - waiting for it to come back\n");
+        nh_log("network stack lost, errno", SocketBase ? Errno() : -1);
+        if (g_client >= 0) { CloseSocket(g_client); g_client = -1; }
+        if (g_listen >= 0) { CloseSocket(g_listen); g_listen = -1; }
+        if (SocketBase) { CloseLibrary(SocketBase); SocketBase = NULL; }
+        Delay(BRINGUP_FAST_DELAY);
+        goto bring_up;
     }
 
     /* not reached in normal operation */
