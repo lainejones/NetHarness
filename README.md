@@ -53,6 +53,9 @@ a genuine click would.
   and from chip RAM; only the registers that can be read without side effects are read
   (DMACONR, VPOSR, VHPOSR, ADKCONR, INTENAR, INTREQR, DENISEID). Audio is therefore which channels
   are playing and their interrupts - Paula's period, volume and sample pointers can't be read back.
+- `nhmcp.py`, the MCP server, now has tools for everything new in 1.14-1.17: `amiga_peek`,
+  `amiga_poke`, `amiga_tasks`, `amiga_libs`, `amiga_disasm`, `amiga_where`, `amiga_crash`,
+  `amiga_leak`, `amiga_chip`, `amiga_copper`, `amiga_sprites` and `amiga_palette`.
 
 **New in 1.16** - find memory leaks:
 
@@ -421,7 +424,7 @@ The binary carries a standard AmigaDOS version cookie:
 
 ```
 $ nhctl.py --host <ip> EXEC "version C:netharness full"
-netharness 1.11 (5.10.2026)
+netharness 1.17 (18.10.2026)
 ```
 
 (The 1.12 package carries the 1.11 binary: only the PC window changed. The
@@ -431,12 +434,12 @@ icons.)
 ## What is in a release
 
 - `NetHarness-<version>.lha` - for the Amiga: the `NetHarness` drawer with the
-  harness, its installer and this README (and `nhctl.py`, for reference).
+  harness, its installer and this README (and `nhctl.py` + `nhinspect.py`, for reference).
 - `NetHarness-<version>.zip` - the same drawer as a zip, for unpacking on a PC.
 - `NetHarness-<version>-PC.zip` - the PC side on its own: `nhctl.py`,
-  `nhgui.py` (+ `nhgui.cmd`), `test_nhgui.py`, `test_dblclick.py`, `nhmcp.py`, this README and
-  the licence. It needs Python 3; the window also needs Tk and Pillow
-  (`pip install pillow`).
+  `nhgui.py` (+ `nhgui.cmd`), `test_nhgui.py`, `test_dblclick.py`, `nhmcp.py`, `nhinspect.py` (the decoders behind
+  PEEK/TASKS/CRASH/LEAK/CHIP and friends), this README and the licence. It needs Python 3; the
+  window also needs Tk and Pillow (`pip install pillow`), and `DISASM` needs `pip install capstone`.
 
 ## Building
 

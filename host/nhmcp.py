@@ -109,7 +109,58 @@ TOOLS = [
      {"local_path": {"type": "string"}, "amiga_path": {"type": "string"}},
      ["local_path", "amiga_path"]),
     ("amiga_reset_input", "Release any stuck mouse buttons/qualifiers.", {}, []),
+    # 1.14+ inspection (addresses are hex strings, with or without 0x)
+    ("amiga_peek", "Hex dump of Amiga memory (1.14+). Reads only RAM/ROM; I/O space is refused.",
+     {"address": {"type": "string", "description": "hex address"},
+      "length": {"type": "integer", "description": "bytes (default 256)"}}, ["address"]),
+    ("amiga_poke", "WRITE bytes into Amiga RAM (1.14+). Can crash the machine - only "
+     "when you know what lives there.",
+     {"address": {"type": "string", "description": "hex address"},
+      "bytes": {"type": "string", "description": "hex bytes, e.g. 4e71"}}, ["address", "bytes"]),
+    ("amiga_tasks", "Every task and process: state, priority, stack use, signals, "
+     "the command a CLI process is running, and its code segments (1.14+).", {}, []),
+    ("amiga_libs", "Open libraries, devices or resources with version, open count and "
+     "base address (1.14+).",
+     {"kind": {"type": "string", "enum": ["libs", "devs", "resources"]}}, []),
+    ("amiga_disasm", "Disassemble 68k code at an address, with library calls named "
+     "(1.14+; needs capstone on the PC).",
+     {"address": {"type": "string", "description": "hex address"},
+      "count": {"type": "integer", "description": "instructions (default 24)"},
+      "a6": {"type": "string", "description": "library a6 holds, e.g. dos.library"}},
+     ["address"]),
+    ("amiga_where", "Which running program, code segment and offset an address is in (1.14+).",
+     {"address": {"type": "string", "description": "hex address"}}, ["address"]),
+    ("amiga_crash", "Crash capture (1.15+). status = show captured crashes (registers, stack, "
+     "code at the PC); on = capture and SUSPEND the crashing task so the machine lives on; "
+     "pass = capture, then let the system handle it as usual; off; clear.",
+     {"action": {"type": "string", "enum": ["status", "on", "pass", "off", "clear"]}}, []),
+    ("amiga_leak", "Leak tracker (1.16+). start <program> records every AllocMem/AllocVec "
+     "it makes; report shows what is still allocated (after it ends = leaked, with call "
+     "sites); stop keeps the report; off restores exec.",
+     {"action": {"type": "string", "enum": ["report", "start", "stop", "off"]},
+      "program": {"type": "string", "description": "command name, for start"}}, []),
+    # 1.17+ hardware views
+    ("amiga_chip", "Custom chips (1.17+): chipset, DMA channels, interrupts, audio "
+     "channels busy, beam line, front screen mode.", {}, []),
+    ("amiga_copper", "Decoded copper lists (1.17+): graphics' start-up list and the frame "
+     "list, or the short frame of an interlaced display.",
+     {"frame": {"type": "string", "enum": ["both", "shf"]}}, []),
+    ("amiga_sprites", "The eight hardware sprites (1.17+): data, position, height, "
+     "attached, owner.", {}, []),
+    ("amiga_palette", "The front screen's colours (1.17+).", {}, []),
 ]
+
+
+def _ctl(*argv):
+    """Run an nhctl command and return what it prints (stdout is our JSON-RPC
+    channel, so it must never reach the real one)."""
+    import contextlib
+    import io
+    from nhctl import run_command
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        with_retry(lambda n: run_command(n, list(argv)))
+    return _text(buf.getvalue().rstrip() or '(nothing)')
 
 
 def tools_list():
@@ -174,6 +225,37 @@ def call_tool(name, a):
     if name == "amiga_reset_input":
         with_retry(lambda n: n.reset_input())
         return _text('input reset')
+    if name == "amiga_peek":
+        return _ctl('PEEK', a["address"], str(a.get("length", 256)))
+    if name == "amiga_poke":
+        return _ctl('POKE', a["address"], a["bytes"])
+    if name == "amiga_tasks":
+        return _ctl('TASKS')
+    if name == "amiga_libs":
+        return _ctl({'libs': 'LIBS', 'devs': 'DEVS', 'resources': 'RESOURCES'}[a.get("kind", "libs")])
+    if name == "amiga_disasm":
+        argv = ['DISASM', a["address"], str(a.get("count", 24))]
+        if a.get("a6"):
+            argv += ['--a6', a["a6"]]
+        return _ctl(*argv)
+    if name == "amiga_where":
+        return _ctl('WHERE', a["address"])
+    if name == "amiga_crash":
+        act = a.get("action", "status")
+        return _ctl('CRASH', *([] if act == 'status' else [act]))
+    if name == "amiga_leak":
+        act = a.get("action", "report")
+        if act == 'start':
+            return _ctl('LEAK', 'START', a["program"])
+        return _ctl('LEAK', *([] if act == 'report' else [act]))
+    if name == "amiga_chip":
+        return _ctl('CHIP')
+    if name == "amiga_copper":
+        return _ctl('COPPER', *(['SHF'] if a.get("frame") == 'shf' else []))
+    if name == "amiga_sprites":
+        return _ctl('SPRITES')
+    if name == "amiga_palette":
+        return _ctl('PALETTE')
     raise ValueError(f'unknown tool {name}')
 
 
@@ -193,7 +275,7 @@ def serve():
             if method == "initialize":
                 result = {"protocolVersion": "2024-11-05",
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "netharness-amiga", "version": "1.3"}}
+                          "serverInfo": {"name": "netharness-amiga", "version": "1.17"}}
             elif method == "tools/list":
                 result = tools_list()
             elif method == "tools/call":

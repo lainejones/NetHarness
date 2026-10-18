@@ -128,7 +128,7 @@
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
 #define NH_VERSION "1.17"
-#define NH_VERDATE "16.10.2026"
+#define NH_VERDATE "18.10.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
 

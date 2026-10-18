@@ -20,7 +20,7 @@ clean:
 #     LhA -r a NetHarness-<version>.lha NetHarness NetHarness.info
 # VERSION is the package version; the binary's own version is NH_VERSION in
 # netharness.c.
-VERSION  = 1.12
+VERSION  = 1.17
 DISTFILE = NetHarness-$(VERSION)
 
 # "make dist" leaves, in ../dist:
@@ -32,11 +32,11 @@ dist: netharness
 	mkdir -p ../dist/stage/NetHarness ../dist/stage-pc/NetHarness-PC/docs
 	cp netharness ../dist/stage/NetHarness/netharness
 	cp ../Install ../Install.info ../README.md ../LICENSE ../dist/stage/NetHarness/
-	cp ../host/nhctl.py ../dist/stage/NetHarness/
+	cp ../host/nhctl.py ../host/nhinspect.py ../dist/stage/NetHarness/
 	@# the drawer's own icon goes BESIDE it, or the unpacked drawer is invisible on Workbench
 	cp ../drawer.info ../dist/stage/NetHarness.info
 	cd ../dist/stage && python3 -m zipfile -c ../$(DISTFILE).zip NetHarness NetHarness.info
-	cp ../host/nhctl.py ../host/nhgui.py ../host/nhgui.cmd ../host/test_nhgui.py ../host/test_dblclick.py ../host/nhmcp.py \
+	cp ../host/nhctl.py ../host/nhgui.py ../host/nhgui.cmd ../host/test_nhgui.py ../host/test_dblclick.py ../host/nhmcp.py ../host/nhinspect.py \
 	   ../README.md ../LICENSE ../dist/stage-pc/NetHarness-PC/
 	cp ../docs/nhgui.png ../dist/stage-pc/NetHarness-PC/docs/
 	cd ../dist/stage-pc && python3 -m zipfile -c ../$(DISTFILE)-PC.zip NetHarness-PC
