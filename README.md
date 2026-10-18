@@ -36,6 +36,24 @@ a genuine click would.
 
 ## What's new (newest first)
 
+**New in 1.14** - look inside the machine:
+
+- `PEEK <addr> <len> [file]` dumps memory and `POKE <addr> <hexbytes>` writes it. Reads
+  only touch memory exec knows about (any RAM, chip RAM from address 0) and the Kickstart
+  ROM, and writes only RAM: a read of an unmapped address can hang real hardware, and some
+  CIA and custom-chip registers change state when they are read, so those are refused.
+- `TASKS` lists every task and process: priority, state, the signals it waits for, its
+  stack size and how much is in use, and where its code segments sit in memory.
+- `LIBS`, `DEVS` and `RESOURCES` list name, version, open count and base address.
+- `DISASM <addr> [count] [--a6 <library>]` disassembles 68k code on the PC (Capstone) and
+  names the library calls. It follows `a6`: `movea.l 4.w,a6` is exec, and when code loads
+  a6 from a variable (`movea.l _DOSBase,a6`) it reads that variable and matches the base
+  against the running libraries, so `jsr -$1e(a6)` comes out as `dos/Open`. The names come
+  from the NDK's .fd files, read where your NDK is (set `NH_FD_DIR`, or it looks in the
+  usual amiga-gcc place); they are not shipped with NetHarness.
+- `WHERE <addr>` says which running program's code an address is in, and the offset.
+- Needs `pip install capstone` on the PC for DISASM; everything else needs nothing new.
+
 **New in 1.13** (the Amiga program):
 
 - The harness survives its TCP/IP stack going away. When the stack's errors

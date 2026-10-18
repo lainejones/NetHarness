@@ -55,6 +55,14 @@ v1.3 - stop guessing pixels:
   REGIONSUM x y w h         4-byte checksum of a region
   WAITCHANGE x y w h [secs] block until that region's checksum changes
   GETFILE <amiga> <local>   copy a file off the Amiga
+
+v1.14 - look inside (memory reads only touch RAM exec knows about and the Kickstart ROM):
+  PEEK <addr> <len> [out]   hex dump (or save to a file); addresses in hex, 0x optional
+  POKE <addr> <hexbytes>    write bytes into RAM (refused anywhere else)
+  TASKS                     every task/process: priority, state, stack size + use, its code segments
+  LIBS | DEVS | RESOURCES   name, version, open count, base address
+  DISASM <addr> [count] [--a6 <lib|base>]   68k disassembly, library calls named from the NDK .fd files
+  WHERE <addr>              which program's code segment holds an address (and the offset in it)
   PUTFILE <local> <amiga>   copy a file onto the Amiga (deploy a binary!)
   RELOAD                    apply C:netharness.new + restart in place
                             (no reboot; REBOOT greyscreens some machines)
@@ -82,6 +90,7 @@ CMD_REGION_SUM, CMD_SHOT_REGION, CMD_GETFILE, CMD_PUTFILE = 14, 15, 16, 17
 CMD_RELOAD = 18
 CMD_EXEC_T, CMD_HELLO = 19, 20          # v1.10
 CMD_EXEC_P = 21                         # v1.11
+CMD_PEEK, CMD_POKE, CMD_TASKS, CMD_LIBS = 22, 23, 24, 25   # v1.14 inspection
 RESP_TEXT = 0x85
 EXEC_TIMED_OUT = -2
 RESP_SCREENSHOT_HDR, RESP_ACK, RESP_EXEC = 0x81, 0x82, 0x83
@@ -559,6 +568,46 @@ class NetHarness:
         out = self._recv_exactly(outlen) if outlen else b''
         return rc, out.decode('latin-1', 'replace')
 
+    # ---- v1.14 inspection -------------------------------------------------------
+
+    def has_inspect(self):
+        return self._at_least(1, 14)
+
+    def peek(self, addr, length):
+        """bytes at addr (RAM or ROM only), fetched in 32 KB pieces"""
+        out = b''
+        while length > 0:
+            n = min(length, 32768)
+            self.sock.sendall(bytes([CMD_PEEK]) + struct.pack('>IH', addr, n if n < 65536 else 0))
+            hdr = self._recv_exactly(9)
+            if hdr[0] != RESP_FILE:
+                raise ConnectionError(f'expected a memory block, got 0x{hdr[0]:02x}')
+            status, got = struct.unpack('>iI', hdr[1:9])
+            if status == -1:
+                raise RuntimeError(f'refused: 0x{addr:08x}+{n} is not RAM exec knows about or the Kickstart ROM')
+            if status != 0:
+                raise RuntimeError(f'refused (status {status})')
+            out += self._recv_exactly(got)
+            addr += n; length -= n
+        return out
+
+    def poke(self, addr, data):
+        self.sock.sendall(bytes([CMD_POKE]) + struct.pack('>IH', addr, len(data)) + data)
+        hdr = self._recv_exactly(5)
+        n = struct.unpack('>I', hdr[1:5])[0]
+        return self._recv_exactly(n).decode('latin-1', 'replace')
+
+    def tasks(self):
+        return self._text_cmd(CMD_TASKS)
+
+    def libs(self, kind=0):
+        self.sock.sendall(bytes([CMD_LIBS, kind]))
+        hdr = self._recv_exactly(5)
+        if hdr[0] != RESP_TEXT:
+            raise ConnectionError(f'expected text response, got 0x{hdr[0]:02x}')
+        n = struct.unpack('>I', hdr[1:5])[0]
+        return self._recv_exactly(n).decode('latin-1', 'replace') if n else ''
+
     def reboot(self):
         self.sock.sendall(bytes([CMD_REBOOT]))
         # no response - the machine is resetting
@@ -721,6 +770,38 @@ def run_command(nh, argv):
             print('REFUSED - could not apply the staged update; old build still running')
             return 1
         print(f'OK reloading {nh.prog_path} - check with VERSION in a few seconds')
+    elif cmd in ('PEEK', 'POKE', 'TASKS', 'LIBS', 'DEVS', 'RESOURCES', 'DISASM', 'WHERE'):
+        import nhinspect
+        if not nh.has_inspect():
+            print(f'{cmd} needs a 1.14+ harness (this one is {nh.version() or "older than 1.10"})', file=sys.stderr)
+            return 1
+        num = lambda x: int(x, 16)
+        if cmd == 'PEEK':
+            addr, n = num(args[0]), int(args[1], 0)
+            data = nh.peek(addr, n)
+            if len(args) > 2:
+                open(args[2], 'wb').write(data); print(f'OK {len(data)} bytes -> {args[2]}')
+            else:
+                print(nhinspect.hexdump(data, addr))
+        elif cmd == 'POKE':
+            print(nh.poke(num(args[0]), bytes.fromhex(''.join(args[1:]))))
+        elif cmd == 'TASKS':
+            print(nhinspect.format_tasks(nh.tasks()))
+        elif cmd in ('LIBS', 'DEVS', 'RESOURCES'):
+            print(nhinspect.format_libs(nh.libs({'LIBS': 0, 'DEVS': 1, 'RESOURCES': 2}[cmd])))
+        elif cmd == 'WHERE':
+            w = nhinspect.segment_of(num(args[0]), nh.tasks())
+            print('%s, code segment %d, offset 0x%x' % w if w else 'not in any running program\'s code')
+        else:   # DISASM
+            a6 = None
+            if '--a6' in args:
+                i = args.index('--a6'); a6 = args[i + 1]; args = args[:i] + args[i + 2:]
+            addr = num(args[0]); count = int(args[1]) if len(args) > 1 else 24
+            data = nh.peek(addr, count * 10)
+            w = nhinspect.segment_of(addr, nh.tasks())
+            if w:
+                print('; %s, code segment %d, offset 0x%x' % w)
+            print(nhinspect.disassemble(data, addr, a6, nh.libs(0) + nh.libs(1), count, peek=nh.peek))
     elif cmd == 'REBOOT':
         nh.reboot(); print('OK (Amiga rebooting)')
     else:

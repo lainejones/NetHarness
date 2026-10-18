@@ -41,6 +41,11 @@
  *       reply's rc is -2 with a note after its output)
  *     CMD_HELLO        = 20  payload: none  -> RESP_TEXT "netharness <ver> <port> <path>"
  *   v1.11 addition:
+ *     CMD_PEEK         = 22  payload: addr4 len2 -> RESP_FILE (status, data)  (1.14:
+ *                             RAM exec knows about, chip RAM from 0, Kickstart ROM)
+ *     CMD_POKE         = 23  payload: addr4 len2 data[len] -> RESP_TEXT "OK n" (RAM only)
+ *     CMD_TASKS        = 24  payload: none -> RESP_TEXT, T/S records (tasks + segments)
+ *     CMD_LIBS         = 25  payload: kind1 (0 libs 1 devices 2 resources) -> RESP_TEXT
  *     CMD_EXEC_P       = 21  payload: pri1 secs2 len2 cmdline[len]  (EXEC_T with
  *       a task priority for the command, -20..19: a full-screen game that
  *       never waits shares the processor with priority 0 and a screen grab
@@ -90,6 +95,8 @@
 #include <graphics/gfx.h>
 #include <dos/dos.h>
 #include <dos/dostags.h>
+#include <dos/dosextens.h>
+#include <exec/execbase.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
 #include <proto/intuition.h>
@@ -110,7 +117,7 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.13"
+#define NH_VERSION "1.14"
 #define NH_VERDATE "16.10.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
@@ -136,6 +143,10 @@ static const char verstag[] __attribute__((used)) =
 #define CMD_EXEC_T       19
 #define CMD_EXEC_P       21
 #define CMD_HELLO        20
+#define CMD_PEEK         22
+#define CMD_POKE         23
+#define CMD_TASKS        24
+#define CMD_LIBS         25
 
 #define RESP_SCREENSHOT_HDR 0x81
 #define RESP_ACK            0x82
@@ -1074,6 +1085,195 @@ static void send_file_status(LONG status)
     send_all(hdr, sizeof(hdr));
 }
 
+/* ---- v1.14: inspection - memory, tasks, libraries ----------------------------
+ * PEEK and POKE touch only memory exec knows about: a MemHeader's range (chip
+ * RAM from address 0, so the vectors can be read), or the Kickstart ROM.  A
+ * read of an unmapped address can hang real hardware (no DTACK), and some CIA
+ * and custom registers change state when they are read - so those are refused. */
+
+#define PEEK_MAX 32768UL
+
+static BOOL nh_in_ram(ULONG a, ULONG len)
+{
+    struct MemHeader *mh;
+    ULONG end = a + len;
+    BOOL ok = FALSE;
+    if (!len || end < a) return FALSE;
+    Forbid();
+    for (mh = (struct MemHeader *)SysBase->MemList.lh_Head; mh->mh_Node.ln_Succ;
+         mh = (struct MemHeader *)mh->mh_Node.ln_Succ) {
+        ULONG lo = (ULONG)mh->mh_Lower, hi = (ULONG)mh->mh_Upper;
+        if ((mh->mh_Attributes & MEMF_CHIP) && lo < 0x10000UL) lo = 0;
+        if (a >= lo && end <= hi) { ok = TRUE; break; }
+    }
+    Permit();
+    return ok;
+}
+
+static BOOL nh_in_rom(ULONG a, ULONG len)
+{
+    ULONG end = a + len, romsize;
+    if (!len || end < a) return FALSE;
+    if (a >= 0xF80000UL && end <= 0x1000000UL) return TRUE;
+    romsize = *(volatile ULONG *)0xFFFFECUL;          /* the size field at the end of every Kickstart */
+    return romsize == 0x100000UL && a >= 0xE00000UL && end <= 0xE80000UL;   /* a 1 MB ROM's low half */
+}
+
+static void send_block_status(LONG status, ULONG len)
+{
+    UBYTE hdr[9];
+    hdr[0] = RESP_FILE;
+    hdr[1] = (UBYTE)(status >> 24); hdr[2] = (UBYTE)(status >> 16);
+    hdr[3] = (UBYTE)(status >> 8);  hdr[4] = (UBYTE)status;
+    hdr[5] = (UBYTE)(len >> 24); hdr[6] = (UBYTE)(len >> 16);
+    hdr[7] = (UBYTE)(len >> 8);  hdr[8] = (UBYTE)len;
+    send_all(hdr, sizeof(hdr));
+}
+
+static void do_peek(ULONG addr, ULONG len)
+{
+    if (len > PEEK_MAX) { send_block_status(-2, 0); return; }
+    if (!nh_in_ram(addr, len) && !nh_in_rom(addr, len)) { send_block_status(-1, 0); return; }
+    send_block_status(0, len);
+    {   /* through a bounce buffer: WinUAE's socket emulation won't send straight from low memory */
+        static UBYTE bounce[1024];
+        while (len) {
+            ULONG n = len > sizeof(bounce) ? sizeof(bounce) : len;
+            CopyMem((APTR)addr, bounce, n);
+            if (!send_all(bounce, n)) break;
+            addr += n; len -= n;
+        }
+    }
+}
+
+static void do_poke(ULONG addr, const UBYTE *data, ULONG len)
+{
+    g_textlen = 0;
+    if (!nh_in_ram(addr, len)) tputs("REFUSED not RAM exec knows about");
+    else {
+        CopyMem((APTR)data, (APTR)addr, len);
+        CacheClearU();                                 /* in case it was code */
+        tputs("OK "); tputnum((LONG)len);
+    }
+    send_text();
+}
+
+static void tputhex(ULONG v)
+{
+    static const char hx[] = "0123456789abcdef";
+    int i;
+    tputs("0x");
+    for (i = 28; i >= 0; i -= 4)
+        if (g_textlen < TEXTBUF_SIZE - 1) g_text[g_textlen++] = hx[(v >> i) & 15];
+}
+
+/* copy a BSTR (BCPL string) into a C buffer */
+static void bstr_copy(BSTR b, char *out, int max)
+{
+    UBYTE *p = (UBYTE *)BADDR(b);
+    int n = p ? p[0] : 0, i;
+    if (n > max - 1) n = max - 1;
+    for (i = 0; i < n; i++) out[i] = (char)p[1 + i];
+    out[n] = 0;
+}
+
+#define NH_MAXTASKS 96
+#define NH_MAXSEGS  8
+struct nh_task {
+    ULONG addr, sigwait, stack, used, seg[NH_MAXSEGS][2];
+    UBYTE type, state, nseg;
+    BYTE  pri;
+    char  name[40], cmd[40];
+};
+static struct nh_task g_tasks[NH_MAXTASKS];
+
+/* called under Disable(): copy what we need, quickly */
+static int grab_task(int n, struct Task *t)
+{
+    struct nh_task *x;
+    if (n >= NH_MAXTASKS || !t) return n;
+    x = &g_tasks[n];
+    memset(x, 0, sizeof(*x));
+    x->addr = (ULONG)t;
+    x->type = t->tc_Node.ln_Type;
+    x->pri = t->tc_Node.ln_Pri;
+    x->state = t->tc_State;
+    x->sigwait = t->tc_SigWait;
+    x->stack = (ULONG)t->tc_SPUpper - (ULONG)t->tc_SPLower;
+    {
+        ULONG sp = (t == FindTask(NULL)) ? (ULONG)&x : (ULONG)t->tc_SPReg;
+        x->used = (sp >= (ULONG)t->tc_SPLower && sp <= (ULONG)t->tc_SPUpper) ? (ULONG)t->tc_SPUpper - sp : 0;
+    }
+    if (t->tc_Node.ln_Name) strncpy(x->name, t->tc_Node.ln_Name, sizeof(x->name) - 1);
+    if (x->type == NT_PROCESS) {
+        struct Process *pr = (struct Process *)t;
+        struct CommandLineInterface *cli = (struct CommandLineInterface *)BADDR(pr->pr_CLI);
+        BPTR seg = 0;
+        if (cli && cli->cli_Module) {
+            bstr_copy(cli->cli_CommandName, x->cmd, sizeof(x->cmd));
+            seg = cli->cli_Module;
+        } else if (pr->pr_SegList) {
+            BPTR *arr = (BPTR *)BADDR(pr->pr_SegList);
+            if (arr && arr[0] >= 3) seg = arr[3];      /* NP_Seglist / a Workbench program */
+        }
+        while (seg && x->nseg < NH_MAXSEGS) {
+            ULONG *p = (ULONG *)BADDR(seg);
+            x->seg[x->nseg][0] = (ULONG)(p + 1);
+            x->seg[x->nseg][1] = p[-1] >= 8 ? p[-1] - 8 : 0;
+            x->nseg++;
+            seg = (BPTR)*p;
+        }
+    }
+    return n + 1;
+}
+
+static void do_tasks(void)
+{
+    struct Node *nd;
+    int n = 0, i, j;
+    static const char *st[] = { "INVALID", "ADDED", "RUN", "READY", "WAIT", "EXCEPT", "REMOVED" };
+    Disable();
+    n = grab_task(n, FindTask(NULL));
+    for (nd = SysBase->TaskReady.lh_Head; nd->ln_Succ; nd = nd->ln_Succ) n = grab_task(n, (struct Task *)nd);
+    for (nd = SysBase->TaskWait.lh_Head; nd->ln_Succ; nd = nd->ln_Succ) n = grab_task(n, (struct Task *)nd);
+    Enable();
+    g_textlen = 0;
+    for (i = 0; i < n; i++) {
+        struct nh_task *x = &g_tasks[i];
+        tputs("T "); tputhex(x->addr);
+        tputs(x->type == NT_PROCESS ? " PROC " : " TASK ");
+        tputnum(x->pri); tputs(" ");
+        tputs(x->state < 7 ? st[x->state] : "?"); tputs(" ");
+        tputhex(x->sigwait); tputs(" ");
+        tputnum((LONG)x->stack); tputs(" "); tputnum((LONG)x->used); tputs(" ");
+        tputq(x->name); tputs(" "); tputq(x->cmd); tputs("\n");
+        for (j = 0; j < x->nseg; j++) {
+            tputs("S "); tputhex(x->addr); tputs(" "); tputnum(j); tputs(" ");
+            tputhex(x->seg[j][0]); tputs(" "); tputnum((LONG)x->seg[j][1]); tputs("\n");
+        }
+    }
+    send_text();
+}
+
+static void do_libs(UBYTE kind)
+{
+    struct List *l = kind == 1 ? &SysBase->DeviceList : kind == 2 ? &SysBase->ResourceList : &SysBase->LibList;
+    struct Node *nd;
+    g_textlen = 0;
+    Forbid();
+    for (nd = l->lh_Head; nd->ln_Succ && g_textlen < TEXTBUF_SIZE - 200; nd = nd->ln_Succ) {
+        struct Library *lb = (struct Library *)nd;
+        tputs("L "); tputhex((ULONG)lb); tputs(" ");
+        tputnum(lb->lib_Version); tputs(" "); tputnum(lb->lib_Revision); tputs(" ");
+        tputnum(lb->lib_OpenCnt); tputs(" "); tputnum(lb->lib_Flags); tputs(" ");
+        tputnum(lb->lib_NegSize); tputs(" "); tputnum(lb->lib_PosSize); tputs(" ");
+        tputq(nd->ln_Name); tputs(" ");
+        tputq(kind == 2 && !lb->lib_IdString ? "" : (const char *)lb->lib_IdString); tputs("\n");
+    }
+    Permit();
+    send_text();
+}
+
 static void do_getfile(const UBYTE *p, UWORD plen)
 {
     char  path[256];
@@ -1411,6 +1611,28 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
         case CMD_HELLO:
             do_hello();
             return 1;
+        case CMD_PEEK:
+            if (avail < 7) return 0;
+            do_peek(((ULONG)b[1] << 24) | ((ULONG)b[2] << 16) | ((ULONG)b[3] << 8) | b[4],
+                    ((ULONG)b[5] << 8) | b[6]);
+            return 7;
+        case CMD_POKE:
+            if (avail < 7) return 0;
+            {
+                ULONG addr = ((ULONG)b[1] << 24) | ((ULONG)b[2] << 16) | ((ULONG)b[3] << 8) | b[4];
+                UWORD dlen = (UWORD)((b[5] << 8) | b[6]);
+                if (7L + dlen > CMDBUF_SIZE) return -1;
+                if ((LONG)avail < 7L + dlen) return 0;
+                do_poke(addr, b + 7, dlen);
+                return (WORD)(7 + dlen);
+            }
+        case CMD_TASKS:
+            do_tasks();
+            return 1;
+        case CMD_LIBS:
+            if (avail < 2) return 0;
+            do_libs(b[1]);
+            return 2;
         case CMD_PING:
             send_ack();
             return 1;
