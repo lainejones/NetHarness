@@ -7,8 +7,8 @@
 CC      = m68k-amigaos-gcc
 CFLAGS  = -m68020 -O2 -noixemul -Wall -fomit-frame-pointer \
 
-netharness: netharness.c nhcrash.S
-	$(CC) $(CFLAGS) -o $@ netharness.c nhcrash.S -lamiga
+netharness: netharness.c nhcrash.S nhleak.S
+	$(CC) $(CFLAGS) -o $@ netharness.c nhcrash.S nhleak.S -lamiga
 
 clean:
 	rm -f netharness

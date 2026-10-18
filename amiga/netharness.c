@@ -48,6 +48,8 @@
  *     CMD_LIBS         = 25  payload: kind1 (0 libs 1 devices 2 resources) -> RESP_TEXT
  *     CMD_CRASH        = 26  payload: op1 (0 report, 1 on + suspend, 2 off, 3 clear,
  *                             4 on + pass on to the OS) -> RESP_TEXT (1.15)
+ *     CMD_LEAK         = 27  payload: op1 len1 name[len] (0 report, 1 start tracking
+ *                             programs called <name>, 2 stop, 3 off) -> RESP_TEXT (1.16)
  *     CMD_EXEC_P       = 21  payload: pri1 secs2 len2 cmdline[len]  (EXEC_T with
  *       a task priority for the command, -20..19: a full-screen game that
  *       never waits shares the processor with priority 0 and a screen grab
@@ -106,6 +108,7 @@
 #include <cybergraphx/cybergraphics.h>
 #include <proto/cybergraphics.h>
 #include <string.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -120,7 +123,7 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.15"
+#define NH_VERSION "1.16"
 #define NH_VERDATE "16.10.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
@@ -151,6 +154,7 @@ static const char verstag[] __attribute__((used)) =
 #define CMD_TASKS        24
 #define CMD_LIBS         25
 #define CMD_CRASH        26
+#define CMD_LEAK         27
 
 #define RESP_SCREENSHOT_HDR 0x81
 #define RESP_ACK            0x82
@@ -1429,6 +1433,269 @@ static void do_crash(UBYTE op)
     send_text();
 }
 
+/* ---- v1.16: the leak tracker ------------------------------------------------------------
+ * nhleak.S holds SetFunction() stubs for AllocMem/FreeMem/AllocVec/FreeVec in a never-freed
+ * block (exec's vectors point into it).  They always call the real function, and call
+ * lk_hook() below while this harness has it installed.  LEAK START <name> records every
+ * allocation made by a task running a command called <name> (or a task of that name); a free
+ * by ANY task removes the entry.  What is left when the program has ended is what it leaked.
+ * The hook runs on whatever task allocates - some have tiny stacks - so it is kept small,
+ * and it never allocates (that would come straight back here). */
+
+extern UBYTE lk_blob[], lk_blob_end[], lk_allocmem[], lk_freemem[], lk_allocvec[], lk_freevec[], lk_semname[];
+
+#define LK_HOOK   4
+#define LK_BUSY   8
+#define LK_OLD    12
+#define LK_SEM    28
+#define LK_SLOTS  4096                 /* a power of 2 */
+#define LK_SEGS   16
+
+struct lk_ent { ULONG addr, size, pc, pc2, task, seq; UBYTE kind; UBYTE pad[3]; };
+static struct lk_ent lk_tab[LK_SLOTS];
+static UBYTE *lk_b;
+static volatile ULONG lk_on, lk_seq, lk_live, lk_allocs, lk_frees, lk_dropped;
+static char lk_name[40];
+static ULONG lk_seg[LK_SEGS][2], lk_segtask[LK_SEGS];
+static int lk_nseg;
+static const LONG lk_lvo[4] = { -198, -210, -684, -690 };   /* AllocMem FreeMem AllocVec FreeVec */
+
+static BOOL lk_namematch(const char *s, int n)
+{
+    /* the last path part of s (n chars) equals lk_name, case-insensitive */
+    int i, start = 0, k;
+    for (i = 0; i < n; i++) if (s[i] == ':' || s[i] == '/') start = i + 1;
+    k = n - start;
+    if (k != (int)strlen(lk_name)) return FALSE;
+    for (i = 0; i < k; i++) {
+        char a = s[start + i], b = lk_name[i];
+        if (a >= 'a' && a <= 'z') a -= 32;
+        if (b >= 'a' && b <= 'z') b -= 32;
+        if (a != b) return FALSE;
+    }
+    return TRUE;
+}
+
+/* is this task running the program we track?  (and note its code the first time) */
+static BOOL lk_tracked(struct Task *t)
+{
+    BPTR seg = 0;
+    BOOL hit = FALSE;
+    int i;
+    if (t->tc_Node.ln_Type == NT_PROCESS) {
+        struct CommandLineInterface *cli = (struct CommandLineInterface *)BADDR(((struct Process *)t)->pr_CLI);
+        if (cli && cli->cli_Module) {
+            UBYTE *b = (UBYTE *)BADDR(cli->cli_CommandName);
+            if (b && lk_namematch((const char *)b + 1, b[0])) { hit = TRUE; seg = cli->cli_Module; }
+        }
+    }
+    if (!hit && t->tc_Node.ln_Name && lk_namematch(t->tc_Node.ln_Name, strlen(t->tc_Node.ln_Name))) {
+        hit = TRUE;
+        if (t->tc_Node.ln_Type == NT_PROCESS && ((struct Process *)t)->pr_SegList) {
+            BPTR *arr = (BPTR *)BADDR(((struct Process *)t)->pr_SegList);
+            if (arr && arr[0] >= 3) seg = arr[3];
+        }
+    }
+    if (hit && seg) {
+        for (i = 0; i < lk_nseg; i++) if (lk_segtask[i] == (ULONG)t && lk_seg[i][0] == (ULONG)BADDR(seg) + 4) break;
+        if (i == lk_nseg)                       /* a new run of the program: note where its code is */
+            while (seg && lk_nseg < LK_SEGS) {
+                ULONG *p = (ULONG *)BADDR(seg);
+                lk_seg[lk_nseg][0] = (ULONG)(p + 1);
+                lk_seg[lk_nseg][1] = p[-1] >= 8 ? p[-1] - 8 : 0;
+                lk_segtask[lk_nseg++] = (ULONG)t;
+                seg = (BPTR)*p;
+            }
+    }
+    return hit;
+}
+
+/* is v a return address - is the instruction just before it a JSR or BSR?  (A pointer to a
+   string or table in the program's code would otherwise pass for one.) */
+static BOOL lk_is_retaddr(ULONG v, ULONG lo)
+{
+    UWORD w2 = v - 2 >= lo ? *(UWORD *)(v - 2) : 0;          /* 2-byte calls */
+    UWORD w4 = v - 4 >= lo ? *(UWORD *)(v - 4) : 0;          /* 4-byte calls */
+    UWORD w6 = v - 6 >= lo ? *(UWORD *)(v - 6) : 0;          /* 6-byte calls */
+    if ((w2 & 0xFFF8) == 0x4E90) return TRUE;                 /* jsr (An) */
+    if ((w2 & 0xFF00) == 0x6100 && (w2 & 0xFF) != 0 && (w2 & 0xFF) != 0xFF) return TRUE;   /* bsr.b */
+    if ((w4 & 0xFFF8) == 0x4EA8 || (w4 & 0xFFF8) == 0x4EB0) return TRUE;   /* jsr d16(An) / d8(An,Xn) */
+    if (w4 == 0x4EB8 || w4 == 0x4EBA || w4 == 0x4EBB || w4 == 0x6100) return TRUE;   /* jsr abs.w / (pc) / bsr.w */
+    if (w6 == 0x4EB9 || w6 == 0x61FF) return TRUE;            /* jsr abs.l / bsr.l */
+    return FALSE;
+}
+
+/* the first return address on the stack that is inside the program's own code */
+static ULONG lk_callsite(struct Task *t, ULONG *sp)
+{
+    int n, i;
+    for (n = 0; n < 96 && (ULONG)(sp + 1) <= (ULONG)t->tc_SPUpper; n++, sp++) {
+        ULONG v = *sp;
+        if (v & 1) continue;
+        for (i = 0; i < lk_nseg; i++)
+            if (lk_segtask[i] == (ULONG)t && v > lk_seg[i][0] && v < lk_seg[i][0] + lk_seg[i][1] &&
+                lk_is_retaddr(v, lk_seg[i][0])) return v;
+    }
+    return 0;
+}
+
+static void lk_hook(LONG kind, ULONG addr, ULONG size, ULONG pc)
+{
+    ULONG h, n;
+    if (!lk_on || !addr) return;
+    Forbid();
+    if (kind == 1 || kind == 3) {
+        struct Task *t = SysBase->ThisTask;
+        if (lk_tracked(t)) {
+            ULONG marker;
+            lk_allocs++;
+            h = (addr >> 3) & (LK_SLOTS - 1);
+            for (n = 0; n < LK_SLOTS && lk_tab[h].addr; n++) h = (h + 1) & (LK_SLOTS - 1);
+            if (n == LK_SLOTS) lk_dropped++;
+            else {
+                lk_tab[h].addr = addr; lk_tab[h].size = size; lk_tab[h].pc = pc;
+                lk_tab[h].pc2 = lk_callsite(t, &marker);
+                lk_tab[h].task = (ULONG)t; lk_tab[h].seq = ++lk_seq; lk_tab[h].kind = (UBYTE)kind;
+                lk_live++;
+            }
+        }
+    } else {
+        h = (addr >> 3) & (LK_SLOTS - 1);
+        for (n = 0; n < LK_SLOTS && lk_tab[h].addr; n++) {
+            if (lk_tab[h].addr == addr) {
+                /* linear probing: pull the following run back over the hole */
+                ULONG j = h, k;
+                lk_tab[h].addr = 0;
+                lk_frees++; lk_live--;
+                for (;;) {
+                    j = (j + 1) & (LK_SLOTS - 1);
+                    if (!lk_tab[j].addr) break;
+                    k = (lk_tab[j].addr >> 3) & (LK_SLOTS - 1);
+                    if ((h <= j) ? (h < k && k <= j) : (h < k || k <= j)) continue;
+                    lk_tab[h] = lk_tab[j]; lk_tab[j].addr = 0; h = j;
+                }
+                break;
+            }
+            h = (h + 1) & (LK_SLOTS - 1);
+        }
+    }
+    Permit();
+}
+
+static UBYTE *lk_find(void)
+{
+    struct SignalSemaphore *sem;
+    Forbid();
+    sem = FindSemaphore((STRPTR)"NetHarness.leak");
+    Permit();
+    return sem ? (UBYTE *)sem - LK_SEM : NULL;
+}
+
+/* this harness is going away: no task may be left inside lk_hook's code */
+static void lk_detach(void)
+{
+    UBYTE *b = lk_find();
+    int i;
+    lk_on = 0;
+    if (!b || *(APTR *)(b + LK_HOOK) != (APTR)lk_hook) return;
+    Forbid();
+    *(APTR volatile *)(b + LK_HOOK) = NULL;
+    Permit();
+    for (i = 0; i < 100 && *(volatile ULONG *)(b + LK_BUSY); i++) Delay(1);
+}
+
+static const char *lk_install(void)
+{
+    UBYTE *b = lk_find();
+    APTR stub[4];
+    int i;
+    if (!b) {
+        ULONG size = (ULONG)(lk_blob_end - lk_blob);
+        struct SignalSemaphore *sem;
+        if (!(b = AllocMem(size, MEMF_PUBLIC | MEMF_CLEAR))) return "no memory";
+        CopyMem(lk_blob, b, size);
+        sem = (struct SignalSemaphore *)(b + LK_SEM);
+        memset(sem, 0, sizeof(*sem));
+        sem->ss_Link.ln_Name = (char *)(b + (lk_semname - lk_blob));
+        AddSemaphore(sem);
+        CacheClearU();
+    }
+    lk_b = b;
+    stub[0] = b + (lk_allocmem - lk_blob); stub[1] = b + (lk_freemem - lk_blob);
+    stub[2] = b + (lk_allocvec - lk_blob); stub[3] = b + (lk_freevec - lk_blob);
+    Forbid();
+    for (i = 0; i < 4; i++) {
+        APTR cur = *(APTR *)((UBYTE *)SysBase + lk_lvo[i] + 2);      /* the JMP's target */
+        if (cur != stub[i]) {
+            APTR old = SetFunction((struct Library *)SysBase, lk_lvo[i], (APTR)stub[i]);
+            *(APTR *)(b + LK_OLD + 4 * i) = old;
+        }
+    }
+    *(APTR volatile *)(b + LK_HOOK) = (APTR)lk_hook;
+    Permit();
+    CacheClearU();
+    return NULL;
+}
+
+/* put exec's own functions back where nobody has patched over us since */
+static void lk_uninstall(void)
+{
+    UBYTE *b = lk_find();
+    APTR stub[4];
+    int i;
+    lk_detach();
+    if (!b) return;
+    stub[0] = b + (lk_allocmem - lk_blob); stub[1] = b + (lk_freemem - lk_blob);
+    stub[2] = b + (lk_allocvec - lk_blob); stub[3] = b + (lk_freevec - lk_blob);
+    Forbid();
+    for (i = 0; i < 4; i++)
+        if (*(APTR *)((UBYTE *)SysBase + lk_lvo[i] + 2) == stub[i])
+            SetFunction((struct Library *)SysBase, lk_lvo[i], *(APTR *)(b + LK_OLD + 4 * i));
+    Permit();
+    CacheClearU();
+}
+
+static BOOL lk_atexit_done;
+
+static void do_leak(UBYTE op, const UBYTE *name, UBYTE nlen)
+{
+    const char *err = NULL;
+    ULONG i, shown = 0;
+    if (op == 1) {
+        if (nlen > sizeof(lk_name) - 1) nlen = sizeof(lk_name) - 1;
+        Forbid();
+        lk_on = 0;
+        memset(lk_tab, 0, sizeof(lk_tab));
+        memcpy(lk_name, name, nlen); lk_name[nlen] = 0;
+        lk_seq = lk_live = lk_allocs = lk_frees = lk_dropped = 0;
+        lk_nseg = 0;
+        Permit();
+        if (!lk_atexit_done) { atexit(lk_detach); lk_atexit_done = TRUE; }
+        if (!(err = lk_install())) lk_on = 1;
+    } else if (op == 2) lk_on = 0;
+    else if (op == 3) lk_uninstall();
+    g_textlen = 0;
+    if (err) { tputs("ERROR "); tputs(err); tputs("\n"); }
+    tputs("STATE "); tputs(lk_on ? "on" : "off");
+    tputs(" allocs "); tputnum((LONG)lk_allocs); tputs(" frees "); tputnum((LONG)lk_frees);
+    tputs(" live "); tputnum((LONG)lk_live); tputs(" dropped "); tputnum((LONG)lk_dropped);
+    tputs(" name "); tputq(lk_name); tputs("\n");
+    for (i = 0; i < (ULONG)lk_nseg; i++) {
+        tputs("S "); tputhex(lk_segtask[i]); tputs(" "); tputhex(lk_seg[i][0]); tputs(" "); tputnum((LONG)lk_seg[i][1]); tputs("\n");
+    }
+    for (i = 0; i < LK_SLOTS && g_textlen < TEXTBUF_SIZE - 120; i++) {
+        struct lk_ent e;
+        Forbid(); e = lk_tab[i]; Permit();
+        if (!e.addr) continue;
+        tputs("A "); tputnum((LONG)e.seq); tputs(" "); tputnum(e.kind); tputs(" ");
+        tputhex(e.addr); tputs(" "); tputnum((LONG)e.size); tputs(" ");
+        tputhex(e.pc); tputs(" "); tputhex(e.pc2); tputs(" "); tputhex(e.task); tputs("\n");
+        shown++;
+    }
+    if (shown < lk_live) { tputs("MORE "); tputnum((LONG)(lk_live - shown)); tputs("\n"); }
+    send_text();
+}
+
 static void do_getfile(const UBYTE *p, UWORD plen)
 {
     char  path[256];
@@ -1788,6 +2055,11 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
             if (avail < 2) return 0;
             do_crash(b[1]);
             return 2;
+        case CMD_LEAK:
+            if (avail < 3) return 0;
+            if ((LONG)avail < 3L + b[2]) return 0;
+            do_leak(b[1], b + 3, b[2]);
+            return (WORD)(3 + b[2]);
         case CMD_LIBS:
             if (avail < 2) return 0;
             do_libs(b[1]);

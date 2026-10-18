@@ -71,6 +71,14 @@ v1.15 - catch crashes:
                             default for a task is a guru and a reboot).  PASS: record, then let the
                             OS handle it as before.  CRASH alone: the report, newest first, with the
                             PC placed in its program and disassembled.
+
+v1.16 - find leaks:
+  LEAK START <program>      record every AllocMem/AllocVec made while <program> runs (its command
+                            name, or a task of that name); frees by anyone remove them
+  LEAK                      what it still holds - once it has ended, that is what it leaked - each
+                            placed in its code (a block allocated inside a library also shows the
+                            line in the program that called it)
+  LEAK STOP | LEAK OFF      stop recording (keep the report) | also give exec its own functions back
   PUTFILE <local> <amiga>   copy a file onto the Amiga (deploy a binary!)
   RELOAD                    apply C:netharness.new + restart in place
                             (no reboot; REBOOT greyscreens some machines)
@@ -100,6 +108,7 @@ CMD_EXEC_T, CMD_HELLO = 19, 20          # v1.10
 CMD_EXEC_P = 21                         # v1.11
 CMD_PEEK, CMD_POKE, CMD_TASKS, CMD_LIBS = 22, 23, 24, 25   # v1.14 inspection
 CMD_CRASH = 26                          # v1.15
+CMD_LEAK = 27                           # v1.16
 RESP_TEXT = 0x85
 EXEC_TIMED_OUT = -2
 RESP_SCREENSHOT_HDR, RESP_ACK, RESP_EXEC = 0x81, 0x82, 0x83
@@ -609,6 +618,15 @@ class NetHarness:
     def tasks(self):
         return self._text_cmd(CMD_TASKS)
 
+    def leak(self, op=0, name=''):
+        nb = name.encode('latin-1')[:39]
+        self.sock.sendall(bytes([CMD_LEAK, op, len(nb)]) + nb)
+        hdr = self._recv_exactly(5)
+        if hdr[0] != RESP_TEXT:
+            raise ConnectionError(f'expected text response, got 0x{hdr[0]:02x}')
+        n = struct.unpack('>I', hdr[1:5])[0]
+        return self._recv_exactly(n).decode('latin-1', 'replace') if n else ''
+
     def crash(self, op=0):
         self.sock.sendall(bytes([CMD_CRASH, op]))
         hdr = self._recv_exactly(5)
@@ -819,6 +837,26 @@ def run_command(nh, argv):
             if w:
                 print('; %s, code segment %d, offset 0x%x' % w)
             print(nhinspect.disassemble(data, addr, a6, nh.libs(0) + nh.libs(1), count, peek=nh.peek))
+    elif cmd == 'LEAK':
+        import nhinspect
+        if not nh._at_least(1, 16):
+            print(f'LEAK needs a 1.16+ harness (this one is {nh.version() or "older than 1.10"})', file=sys.stderr)
+            return 1
+        sub = (args[0] if args else '').upper()
+        op = {'': 0, 'START': 1, 'STOP': 2, 'OFF': 3}.get(sub)
+        if op is None or (op == 1 and len(args) < 2):
+            print('LEAK START <program> | LEAK | LEAK STOP | LEAK OFF', file=sys.stderr); return 1
+        txt = nh.leak(op, args[1] if op == 1 else '')
+        name = ''
+        for l in txt.splitlines():
+            if l.startswith('STATE '):
+                name = nhinspect.parse_records(l, 'STATE')[0][-1]
+        running = None
+        if name and op in (0, 2, 3):
+            t = nh.tasks()
+            running = any(r[8].lower().split(':')[-1].split('/')[-1] == name.lower() or r[7].lower() == name.lower()
+                          for r in nhinspect.parse_records(t, 'T'))
+        print(nhinspect.format_leak(txt, running=running))
     elif cmd == 'CRASH':
         import nhinspect
         if not nh._at_least(1, 15):

@@ -296,3 +296,68 @@ def format_crash(text, tasks_text='', libs_text='', peek=None):
             except Exception as e:
                 out.append('    (code at the PC not readable: %s)' % e)
     return '\n'.join(out)
+
+
+# ---- LEAK (1.16) ------------------------------------------------------------------------------
+
+LEAK_KINDS = {1: 'AllocMem', 2: 'FreeMem', 3: 'AllocVec', 4: 'FreeVec'}
+
+
+def format_leak(text, libs_text='', running=None):
+    """the LEAK report: what the tracked program still holds, oldest first, each placed in its code"""
+    head, segs, ents, more = {}, [], [], 0
+    for line in text.splitlines():
+        if line.startswith('STATE '):
+            p = parse_records(line, 'STATE')[0]
+            head = {'on': p[0] == 'on'}
+            head.update(dict(zip(p[1::2], p[2::2])))
+        elif line.startswith('ERROR '):
+            head['error'] = line[6:]
+        elif line.startswith('S '):
+            t, start, size = line.split()[1:4]
+            segs.append((int(t, 16), int(start, 16), int(size)))
+        elif line.startswith('A '):
+            seq, kind, addr, size, pc, pc2, task = line.split()[1:8]
+            ents.append({'seq': int(seq), 'kind': int(kind), 'addr': int(addr, 16), 'size': int(size),
+                         'pc': int(pc, 16), 'pc2': int(pc2, 16), 'task': int(task, 16)})
+        elif line.startswith('MORE '):
+            more = int(line.split()[1])
+    out = []
+    if head.get('error'):
+        out.append('ERROR: ' + head['error'])
+    name = head.get('name', '')
+    out.append('leak tracking is %s for "%s": %s allocations, %s frees, %s still held%s' % (
+        'ON' if head.get('on') else 'OFF', name, head.get('allocs', 0), head.get('frees', 0), head.get('live', 0),
+        (', %s NOT RECORDED (table full)' % head['dropped']) if head.get('dropped', '0') != '0' else ''))
+
+    def where(a):
+        for i, (t, start, size) in enumerate(segs):
+            if start <= a < start + size:
+                n = sum(1 for x in segs[:i] if x[0] == t)        # segment number within that run
+                return '%s seg %d +0x%x' % (name, n, a - start)
+        if 0xF80000 <= a < 0x1000000 or 0xE00000 <= a < 0xE80000:
+            return 'ROM 0x%x' % a
+        return '0x%08x' % a
+
+    # exec's AllocVec is built on AllocMem: hide the AllocMem that sits 4 bytes under an AllocVec
+    vecs = {e['addr'] for e in ents if e['kind'] == 3}
+    ents = [e for e in ents if not (e['kind'] == 1 and e['addr'] + 4 in vecs)]
+    ents.sort(key=lambda e: e['seq'])
+    total = sum(e['size'] for e in ents)
+    if running is False:
+        out.append('the program has ended, so everything below was LEAKED (%d block%s, %d bytes known):' %
+                   (len(ents), '' if len(ents) == 1 else 's', total))
+    elif ents:
+        out.append('still held (the program may still be running, so not all of this is a leak yet):')
+    for e in ents:
+        here = where(e['pc'])
+        line = '  #%-4d %-8s %8s bytes at 0x%08x  from %s' % (e['seq'], LEAK_KINDS.get(e['kind'], '?'),
+                                                            e['size'] if e['size'] else '?', e['addr'], here)
+        if e['pc2'] and not here.startswith(name):
+            line += '  <- called from %s' % where(e['pc2'])
+        out.append(line)
+    if more:
+        out.append('  ... and %d more (the report is capped)' % more)
+    if not ents and running is False:
+        out.append('nothing left over - no leaks')
+    return '\n'.join(out)

@@ -36,6 +36,30 @@ a genuine click would.
 
 ## What's new (newest first)
 
+**New in 1.16** - find memory leaks:
+
+- `LEAK START <program>`, then run the program. Every `AllocMem` and `AllocVec` it makes is
+  recorded with its size and where in the program it came from; a `FreeMem` or `FreeVec` by any
+  task removes the entry. `LEAK` shows what is left - once the program has ended, that is what
+  it leaked:
+
+      the program has ended, so everything below was LEAKED (5 blocks, 3151 bytes known):
+        #20   AllocMem      100 bytes at 0x08210dd8  from leaktest seg 0 +0x144
+        #23   AllocVec     2000 bytes at 0x0821795c  from leaktest seg 0 +0x162
+        #31   AllocVec       52 bytes at 0x0820d7e4  from ROM 0xf96848  <- called from leaktest seg 0 +0x1c8
+
+  The last line is a file that was never closed: dos allocated its handle, and the report still
+  points at the `Open()` in the program, by finding the first real return address into the
+  program's code on its stack.
+- `LEAK STOP` stops recording and keeps the report; `LEAK OFF` also gives exec back its own
+  functions.
+- How it works: small stubs for the four exec functions go into memory of their own that is
+  never freed, and always do the real work; they only call the tracker while a harness has it
+  switched on, and a harness that exits waits until no task is inside it. So stopping or
+  updating the harness mid-run is safe. The tracker never allocates and uses very little stack -
+  it runs on whichever task allocates.
+- `leaktest` (in `amiga/`) leaks on purpose, to try it.
+
 **New in 1.15** - catch crashes:
 
 - `CRASH ON` watches every task that has no trap handler of its own. When one crashes (an
