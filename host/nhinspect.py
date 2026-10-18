@@ -421,8 +421,11 @@ def parse_gfx(text):
 
 
 def chipset_name(info):
+    # ChipRevBits0: bit 0 ECS Agnus, bit 1 ECS Denise, bit 2 AGA Alice
     rev = info.get('chiprev', 0)
-    return 'AGA' if rev & 4 else 'ECS' if rev & 3 else 'OCS'
+    if rev & 4:
+        return 'AGA'
+    return {3: 'ECS', 1: 'ECS Agnus + OCS Denise', 2: 'OCS Agnus + ECS Denise'}.get(rev & 3, 'OCS')
 
 
 def read_copper(peek, addr, max_words=4096):
