@@ -46,6 +46,8 @@
  *     CMD_POKE         = 23  payload: addr4 len2 data[len] -> RESP_TEXT "OK n" (RAM only)
  *     CMD_TASKS        = 24  payload: none -> RESP_TEXT, T/S records (tasks + segments)
  *     CMD_LIBS         = 25  payload: kind1 (0 libs 1 devices 2 resources) -> RESP_TEXT
+ *     CMD_CRASH        = 26  payload: op1 (0 report, 1 on + suspend, 2 off, 3 clear,
+ *                             4 on + pass on to the OS) -> RESP_TEXT (1.15)
  *     CMD_EXEC_P       = 21  payload: pri1 secs2 len2 cmdline[len]  (EXEC_T with
  *       a task priority for the command, -20..19: a full-screen game that
  *       never waits shares the processor with priority 0 and a screen grab
@@ -104,6 +106,7 @@
 #include <cybergraphx/cybergraphics.h>
 #include <proto/cybergraphics.h>
 #include <string.h>
+#include <stddef.h>
 #include <stdio.h>
 
 #include <sys/socket.h>
@@ -117,7 +120,7 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.14"
+#define NH_VERSION "1.15"
 #define NH_VERDATE "16.10.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
@@ -147,6 +150,7 @@ static const char verstag[] __attribute__((used)) =
 #define CMD_POKE         23
 #define CMD_TASKS        24
 #define CMD_LIBS         25
+#define CMD_CRASH        26
 
 #define RESP_SCREENSHOT_HDR 0x81
 #define RESP_ACK            0x82
@@ -1274,6 +1278,157 @@ static void do_libs(UBYTE kind)
     send_text();
 }
 
+/* ---- v1.15: crash capture --------------------------------------------------------------
+ * nhcrash.S is a task trap handler.  CRASH ON copies it into memory that is never freed
+ * (tasks keep a pointer to it, so it must outlive this harness), makes it exec's default
+ * (SysBase->TaskTrapCode) and points every existing task still on exec's default at it.
+ * It records the crash and passes on to the previous handler, so the usual Software
+ * Failure requester still appears.  A later harness finds the block by its semaphore. */
+
+extern UBYTE nh_blob[], nh_blob_end[], nh_trap[], nh_semname[];
+
+#define CR_MAGIC   0x4E484352UL
+#define CR_MODE    4
+#define CR_OLD     8
+#define CR_COUNT   12
+#define CR_SEM     16
+#define CR_RECS    64
+#define CR_RECSZ   240
+#define CR_NRECS   4
+
+/* the offsets nhcrash.S was written against */
+typedef char nh_chk_thistask[offsetof(struct ExecBase, ThisTask) == 276 ? 1 : -1];
+typedef char nh_chk_splower[offsetof(struct Task, tc_SPLower) == 58 ? 1 : -1];
+typedef char nh_chk_spupper[offsetof(struct Task, tc_SPUpper) == 62 ? 1 : -1];
+typedef char nh_chk_lnname[offsetof(struct Node, ln_Name) == 10 ? 1 : -1];
+typedef char nh_chk_attn[offsetof(struct ExecBase, AttnFlags) == 296 ? 1 : -1];
+typedef char nh_chk_sem[sizeof(struct SignalSemaphore) <= CR_RECS - CR_SEM ? 1 : -1];
+
+static UBYTE *crash_find(void)
+{
+    struct SignalSemaphore *sem;
+    Forbid();
+    sem = FindSemaphore((STRPTR)"NetHarness.crash");
+    Permit();
+    if (!sem) return NULL;
+    return (UBYTE *)sem - CR_SEM;
+}
+
+/* point tasks using handler `from` at handler `to` */
+static void crash_retarget(APTR from, APTR to)
+{
+    struct Node *nd;
+    Disable();
+    if (((struct Task *)FindTask(NULL))->tc_TrapCode == from) ((struct Task *)FindTask(NULL))->tc_TrapCode = to;
+    for (nd = SysBase->TaskReady.lh_Head; nd->ln_Succ; nd = nd->ln_Succ)
+        if (((struct Task *)nd)->tc_TrapCode == from) ((struct Task *)nd)->tc_TrapCode = to;
+    for (nd = SysBase->TaskWait.lh_Head; nd->ln_Succ; nd = nd->ln_Succ)
+        if (((struct Task *)nd)->tc_TrapCode == from) ((struct Task *)nd)->tc_TrapCode = to;
+    Enable();
+}
+
+static const char *crash_on(ULONG mode)
+{
+    UBYTE *b = crash_find();
+    APTR trap;
+    if (!b) {
+        ULONG size = (ULONG)(nh_blob_end - nh_blob);
+        struct SignalSemaphore *sem;
+        if (!(b = AllocMem(size, MEMF_PUBLIC | MEMF_CLEAR))) return "no memory";
+        CopyMem(nh_blob, b, size);
+        sem = (struct SignalSemaphore *)(b + CR_SEM);
+        memset(sem, 0, sizeof(*sem));
+        sem->ss_Link.ln_Name = (char *)(b + (nh_semname - nh_blob));
+        sem->ss_Link.ln_Pri = 0;
+        AddSemaphore(sem);
+        CacheClearU();
+    }
+    trap = (APTR)(b + (nh_trap - nh_blob));
+    *(volatile ULONG *)(b + CR_MODE) = mode;
+    Forbid();
+    if (SysBase->TaskTrapCode != trap) {
+        *(APTR *)(b + CR_OLD) = SysBase->TaskTrapCode;
+        SysBase->TaskTrapCode = trap;
+    }
+    Permit();
+    crash_retarget(*(APTR *)(b + CR_OLD), trap);
+    return NULL;
+}
+
+static void crash_off(void)
+{
+    UBYTE *b = crash_find();
+    APTR trap, old;
+    if (!b) return;
+    trap = (APTR)(b + (nh_trap - nh_blob));
+    old = *(APTR *)(b + CR_OLD);
+    Forbid();
+    if (SysBase->TaskTrapCode == trap) SysBase->TaskTrapCode = old;
+    Permit();
+    crash_retarget(trap, old);             /* the block stays: a task may still be inside it */
+}
+
+static ULONG getl(const UBYTE *p) { return ((ULONG)p[0] << 24) | ((ULONG)p[1] << 16) | ((ULONG)p[2] << 8) | p[3]; }
+
+static void tputhexbytes(const UBYTE *p, int n)
+{
+    static const char hx[] = "0123456789abcdef";
+    int i;
+    for (i = 0; i < n && g_textlen < TEXTBUF_SIZE - 3; i++) {
+        g_text[g_textlen++] = hx[p[i] >> 4];
+        g_text[g_textlen++] = hx[p[i] & 15];
+    }
+}
+
+static void do_crash(UBYTE op)
+{
+    UBYTE *b;
+    const char *err = NULL;
+    if (op == 1 || op == 4) err = crash_on(op == 1 ? 1 : 0);
+    else if (op == 2) crash_off();
+    b = crash_find();
+    if (op == 3 && b) {
+        Disable();
+        *(ULONG *)(b + CR_COUNT) = 0;
+        memset(b + CR_RECS, 0, CR_RECSZ * CR_NRECS);
+        Enable();
+    }
+    g_textlen = 0;
+    if (err) { tputs("ERROR "); tputs(err); tputs("\n"); }
+    if (!b) { tputs("STATE off count 0\n"); send_text(); return; }
+    {
+        ULONG count, i, first;
+        static UBYTE rec[CR_RECSZ];
+        tputs("STATE ");
+        tputs(SysBase->TaskTrapCode == (APTR)(b + (nh_trap - nh_blob)) ? "on" : "off");
+        count = *(ULONG *)(b + CR_COUNT);
+        tputs(" count "); tputnum((LONG)count);
+        tputs(" mode "); tputs(*(ULONG *)(b + CR_MODE) ? "suspend" : "pass");
+        tputs(" cpu "); tputnum((LONG)SysBase->AttnFlags);
+        tputs("\n");
+        first = count > CR_NRECS ? count - CR_NRECS : 0;
+        for (i = count; i > first; i--) {               /* newest first */
+            const UBYTE *r = b + CR_RECS + ((i - 1) % CR_NRECS) * CR_RECSZ;
+            int j;
+            Disable();
+            CopyMem((APTR)r, rec, CR_RECSZ);
+            Enable();
+            tputs("R "); tputnum((LONG)getl(rec + 232)); tputs(" ");
+            tputnum((LONG)getl(rec + 0)); tputs(" ");
+            tputhex(getl(rec + 4)); tputs(" ");
+            tputhex(getl(rec + 8)); tputs(" ");
+            rec[231] = 0; tputq((const char *)(rec + 200));
+            tputs(getl(rec + 236) ? " suspended" : " passed"); tputs("\n");
+            tputs("G");
+            for (j = 0; j < 15; j++) { tputs(" "); tputhex(getl(rec + 12 + j * 4)); }
+            tputs("\nF "); tputhexbytes(rec + 72, 64);
+            tputs("\nK "); tputhexbytes(rec + 136, 64);
+            tputs("\n");
+        }
+    }
+    send_text();
+}
+
 static void do_getfile(const UBYTE *p, UWORD plen)
 {
     char  path[256];
@@ -1629,6 +1784,10 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
         case CMD_TASKS:
             do_tasks();
             return 1;
+        case CMD_CRASH:
+            if (avail < 2) return 0;
+            do_crash(b[1]);
+            return 2;
         case CMD_LIBS:
             if (avail < 2) return 0;
             do_libs(b[1]);

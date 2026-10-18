@@ -36,6 +36,28 @@ a genuine click would.
 
 ## What's new (newest first)
 
+**New in 1.15** - catch crashes:
+
+- `CRASH ON` watches every task that has no trap handler of its own. When one crashes (an
+  illegal instruction, divide by zero, an address error, line-A/F, `TRAP #n`, ...) the harness
+  records the exception, all 16 registers, the CPU's exception frame with its fault address,
+  the top of the task's stack and its name.
+- Then it **suspends the program** - leaves it asleep, holding what it had - so the machine
+  carries on. (A crashing task normally gets a dead-end alert: a guru, then a reboot, which
+  also loses the evidence.) Crashes that can't be resumed that way - bus-error frames, a
+  68000's bus/address errors, crashes in supervisor mode - are recorded and passed on as
+  before. `CRASH PASS` records every crash and always passes it on.
+- `CRASH` alone shows the last four, newest first: what happened, the PC (and, for a divide by
+  zero, the instruction that did it), which program and offset it was in, the registers,
+  the stack, and a disassembly with the faulting instruction marked. `TASKS` marks the
+  suspended programs. `CRASH OFF` gives the OS back its own handler; `CRASH CLEAR` empties
+  the record.
+- The catcher lives in memory of its own that is never freed, so a harness restart or
+  `UPDATE` keeps both it and the records (tasks point at it, so it must outlive the harness).
+  It is 68000 code and reads a task's stack only when the stack pointer is inside that task's
+  own stack.
+- `crashtest illegal|div0|odd|trap|linef` (in `amiga/`) crashes on purpose, to try it.
+
 **New in 1.14** - look inside the machine:
 
 - `PEEK <addr> <len> [file]` dumps memory and `POKE <addr> <hexbytes>` writes it. Reads

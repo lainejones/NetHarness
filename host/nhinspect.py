@@ -85,6 +85,8 @@ def format_tasks(text):
         addr, kind, pri, state, sigw, stack, used, name, cmd = t[:9]
         st, us = int(stack), int(used)
         warn = '  <-- %d%% of its stack' % (us * 100 // st) if st and us * 100 >= st * 80 else ''
+        if state == 'WAIT' and int(sigw, 16) == 0:
+            warn += '  <-- waits for nothing: suspended (see CRASH)'
         label = name + (' [%s]' % cmd if cmd else '')
         out.append('%-10s %-4s %4s %-5s %10s %7d %7d  %s%s' % (addr, kind, pri, state, sigw, st, us, label, warn))
     if segs:
@@ -163,4 +165,134 @@ def disassemble(data, addr, a6_lib=None, libs_text=None, count=None, peek=None):
         out.append('%08x  %-20s %-32s%s' % (ins.address, hx, text, ('  ; ' + note) if note else ''))
     if not out:
         out.append('(nothing decoded)')
+    return '\n'.join(out)
+
+
+# ---- CRASH (1.15) -----------------------------------------------------------------------------
+
+TRAPS = {2: 'bus error', 3: 'address error', 4: 'illegal instruction', 5: 'divide by zero',
+         6: 'CHK instruction', 7: 'TRAPV', 8: 'privilege violation', 9: 'trace', 10: 'line-A instruction',
+         11: 'line-F instruction (no FPU / unknown FPU op)', 14: 'format error'}
+
+
+def trap_name(n):
+    if 32 <= n <= 47:
+        return 'TRAP #%d' % (n - 32)
+    return TRAPS.get(n, 'exception %d' % n)
+
+
+def parse_crash(text):
+    """-> (state dict, [record dicts]) from a CRASH report"""
+    state, recs, cur = {}, [], None
+    for line in text.splitlines():
+        if line.startswith('STATE '):
+            p = line.split()
+            kv = dict(zip(p[2::2], p[3::2]))
+            state = {'on': p[1] == 'on', 'count': int(kv.get('count', 0)), 'cpu': int(kv.get('cpu', 0)),
+                     'mode': kv.get('mode', 'pass')}
+        elif line.startswith('ERROR '):
+            state['error'] = line[6:]
+        elif line.startswith('R '):
+            r = parse_records(line, 'R')[0]
+            cur = {'seq': int(r[0]), 'trap': int(r[1]), 'task': int(r[2], 16), 'usp': int(r[3], 16), 'name': r[4],
+                   'suspended': len(r) > 5 and r[5] == 'suspended'}
+            recs.append(cur)
+        elif line.startswith('G ') and cur is not None:
+            v = [int(x, 16) for x in line.split()[1:]]
+            cur['d'], cur['a'] = v[:8], v[8:15]
+        elif line.startswith('F ') and cur is not None:
+            cur['frame'] = bytes.fromhex(line[2:].strip())
+        elif line.startswith('K ') and cur is not None:
+            cur['stack'] = bytes.fromhex(line[2:].strip())
+    return state, recs
+
+
+def frame_info(frame, cpu):
+    """SR, PC, format and the fault address (if the frame has one) from the CPU's exception frame"""
+    import struct
+    sr, pc = struct.unpack('>HI', frame[:6])
+    info = {'sr': sr, 'pc': pc, 'format': None, 'fault': None}
+    if cpu & 1:                                   # AFF_68010: 68010+ frames carry a format word
+        fw = struct.unpack('>H', frame[6:8])[0]
+        fmt = fw >> 12
+        info['format'] = fmt
+        if fmt == 2 and len(frame) >= 12:         # address error (040) / trap-after frames: the address
+            info['fault'] = struct.unpack('>I', frame[8:12])[0]
+        elif fmt == 7 and len(frame) >= 24:       # 68040 access fault: effective address
+            info['fault'] = struct.unpack('>I', frame[0x14:0x18])[0]
+        elif fmt in (0xA, 0xB) and len(frame) >= 20:   # 68020/030 bus fault: data cycle fault address
+            info['fault'] = struct.unpack('>I', frame[0x10:0x14])[0]
+    return info
+
+
+def cpu_name(cpu):
+    return ('68060' if cpu & 0x80 else '68040' if cpu & 8 else '68030' if cpu & 4 else
+            '68020' if cpu & 2 else '68010' if cpu & 1 else '68000') + (' + FPU' if cpu & 0x30 or cpu & 0x40 else '')
+
+
+def code_start_before(pc, peek, back=16):
+    """a start address up to `back` bytes before pc from which decoding lands exactly ON pc"""
+    import capstone
+    md = capstone.Cs(capstone.CS_ARCH_M68K, capstone.CS_MODE_BIG_ENDIAN | capstone.CS_MODE_M68K_040)
+    for b in range(back, 0, -2):
+        try:
+            data = peek(pc - b, b + 2)
+        except Exception:
+            continue
+        addrs = [i.address for i in md.disasm(data, pc - b)]
+        if pc in addrs:
+            return pc - b
+    return pc
+
+
+def format_crash(text, tasks_text='', libs_text='', peek=None):
+    state, recs = parse_crash(text)
+    out = []
+    if state.get('error'):
+        out.append('ERROR: ' + state['error'])
+    mode = {'suspend': ' (crashed programs are suspended, the machine carries on)',
+            'pass': ' (crashes are passed on to the OS as usual)'}.get(state.get('mode'), '')
+    out.append('crash capture is %s%s - %d crash%s caught (%s)' %
+               ('ON' if state.get('on') else 'OFF', mode if state.get('on') else '', state.get('count', 0),
+                '' if state.get('count') == 1 else 'es', cpu_name(state.get('cpu', 0))))
+    for r in recs:
+        fi = frame_info(r.get('frame', b'\0' * 8), state.get('cpu', 0))
+        out.append('')
+        out.append('#%d  %s in task "%s" (0x%08x) - %s' % (r['seq'], trap_name(r['trap']), r['name'], r['task'],
+                   'suspended by NetHarness' if r.get('suspended') else 'passed on to the OS'))
+        line = '    PC 0x%08x  SR 0x%04x' % (fi['pc'], fi['sr'])
+        # format 2 holds an address: the access address for an address error, the instruction
+        # that caused it for the "after" exceptions (divide by zero, CHK, TRAPV, trace)
+        after = fi['format'] == 2 and r['trap'] in (5, 6, 7, 9)
+        mark = fi['fault'] if after and fi['fault'] is not None else fi['pc']
+        if fi['fault'] is not None:
+            line += ('  faulting instruction at 0x%08x' if after else '  fault address 0x%08x') % fi['fault']
+        if fi['format'] is not None:
+            line += '  (frame format $%X)' % fi['format']
+        out.append(line)
+        w = segment_of(mark, tasks_text) if tasks_text else None
+        out.append('    ' + ('in %s, code segment %d, offset 0x%x' % w if w
+                             else 'the PC is not in a running program\'s code (ROM, a library, or the program has gone)'))
+        d, a = r.get('d', [0] * 8), r.get('a', [0] * 7)
+        out.append('    ' + '  '.join('d%d %08x' % (i, d[i]) for i in range(4)))
+        out.append('    ' + '  '.join('d%d %08x' % (i, d[i]) for i in range(4, 8)))
+        out.append('    ' + '  '.join('a%d %08x' % (i, a[i]) for i in range(4)))
+        out.append('    ' + '  '.join('a%d %08x' % (i, a[i]) for i in range(4, 7)) + '  a7 %08x (usp)' % r['usp'])
+        st = r.get('stack', b'')
+        if any(st):
+            import struct
+            longs = struct.unpack('>16I', st[:64])
+            out.append('    stack: ' + ' '.join('%08x' % x for x in longs[:8]))
+            out.append('           ' + ' '.join('%08x' % x for x in longs[8:]))
+        else:
+            out.append('    stack: (usp is outside the task\'s own stack - not read)')
+        if peek:
+            try:
+                start = code_start_before(mark, peek)
+                code = peek(start, (mark - start) + 24)
+                out.append('    code at the PC (>> = the instruction that faulted, or the one after a TRAP):')
+                for l in disassemble(code, start, None, libs_text, 10, peek).splitlines():
+                    out.append('    %s %s' % ('>>' if l.startswith('%08x' % mark) else '  ', l))
+            except Exception as e:
+                out.append('    (code at the PC not readable: %s)' % e)
     return '\n'.join(out)

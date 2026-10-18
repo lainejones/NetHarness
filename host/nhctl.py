@@ -63,6 +63,14 @@ v1.14 - look inside (memory reads only touch RAM exec knows about and the Kickst
   LIBS | DEVS | RESOURCES   name, version, open count, base address
   DISASM <addr> [count] [--a6 <lib|base>]   68k disassembly, library calls named from the NDK .fd files
   WHERE <addr>              which program's code segment holds an address (and the offset in it)
+
+v1.15 - catch crashes:
+  CRASH [ON|PASS|OFF|CLEAR] ON: every task without its own trap handler is watched; a crash is
+                            recorded (exception, registers, frame, fault address, stack, task) and
+                            the program is SUSPENDED (left asleep, so the machine carries on - exec's
+                            default for a task is a guru and a reboot).  PASS: record, then let the
+                            OS handle it as before.  CRASH alone: the report, newest first, with the
+                            PC placed in its program and disassembled.
   PUTFILE <local> <amiga>   copy a file onto the Amiga (deploy a binary!)
   RELOAD                    apply C:netharness.new + restart in place
                             (no reboot; REBOOT greyscreens some machines)
@@ -91,6 +99,7 @@ CMD_RELOAD = 18
 CMD_EXEC_T, CMD_HELLO = 19, 20          # v1.10
 CMD_EXEC_P = 21                         # v1.11
 CMD_PEEK, CMD_POKE, CMD_TASKS, CMD_LIBS = 22, 23, 24, 25   # v1.14 inspection
+CMD_CRASH = 26                          # v1.15
 RESP_TEXT = 0x85
 EXEC_TIMED_OUT = -2
 RESP_SCREENSHOT_HDR, RESP_ACK, RESP_EXEC = 0x81, 0x82, 0x83
@@ -600,6 +609,14 @@ class NetHarness:
     def tasks(self):
         return self._text_cmd(CMD_TASKS)
 
+    def crash(self, op=0):
+        self.sock.sendall(bytes([CMD_CRASH, op]))
+        hdr = self._recv_exactly(5)
+        if hdr[0] != RESP_TEXT:
+            raise ConnectionError(f'expected text response, got 0x{hdr[0]:02x}')
+        n = struct.unpack('>I', hdr[1:5])[0]
+        return self._recv_exactly(n).decode('latin-1', 'replace') if n else ''
+
     def libs(self, kind=0):
         self.sock.sendall(bytes([CMD_LIBS, kind]))
         hdr = self._recv_exactly(5)
@@ -802,6 +819,15 @@ def run_command(nh, argv):
             if w:
                 print('; %s, code segment %d, offset 0x%x' % w)
             print(nhinspect.disassemble(data, addr, a6, nh.libs(0) + nh.libs(1), count, peek=nh.peek))
+    elif cmd == 'CRASH':
+        import nhinspect
+        if not nh._at_least(1, 15):
+            print(f'CRASH needs a 1.15+ harness (this one is {nh.version() or "older than 1.10"})', file=sys.stderr)
+            return 1
+        op = {'': 0, 'ON': 1, 'OFF': 2, 'CLEAR': 3, 'PASS': 4}.get((args[0] if args else '').upper())
+        if op is None:
+            print('CRASH [ON|PASS|OFF|CLEAR]', file=sys.stderr); return 1
+        print(nhinspect.format_crash(nh.crash(op), nh.tasks(), nh.libs(0) + nh.libs(1), nh.peek))
     elif cmd == 'REBOOT':
         nh.reboot(); print('OK (Amiga rebooting)')
     else:
