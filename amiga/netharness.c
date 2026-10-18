@@ -50,6 +50,8 @@
  *                             4 on + pass on to the OS) -> RESP_TEXT (1.15)
  *     CMD_LEAK         = 27  payload: op1 len1 name[len] (0 report, 1 start tracking
  *                             programs called <name>, 2 stop, 3 off) -> RESP_TEXT (1.16)
+ *     CMD_GFX          = 28  payload: op1 (0 graphics state, 1 front screen palette)
+ *                             -> RESP_TEXT (1.17)
  *     CMD_EXEC_P       = 21  payload: pri1 secs2 len2 cmdline[len]  (EXEC_T with
  *       a task priority for the command, -20..19: a full-screen game that
  *       never waits shares the processor with priority 0 and a screen grab
@@ -97,6 +99,8 @@
 #include <intuition/intuition.h>
 #include <intuition/screens.h>
 #include <graphics/gfx.h>
+#include <graphics/gfxbase.h>
+#include <graphics/sprite.h>
 #include <dos/dos.h>
 #include <dos/dostags.h>
 #include <dos/dosextens.h>
@@ -123,7 +127,7 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.16"
+#define NH_VERSION "1.17"
 #define NH_VERDATE "16.10.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
@@ -155,6 +159,7 @@ static const char verstag[] __attribute__((used)) =
 #define CMD_LIBS         25
 #define CMD_CRASH        26
 #define CMD_LEAK         27
+#define CMD_GFX          28
 
 #define RESP_SCREENSHOT_HDR 0x81
 #define RESP_ACK            0x82
@@ -1696,6 +1701,82 @@ static void do_leak(UBYTE op, const UBYTE *name, UBYTE nlen)
     send_text();
 }
 
+/* ---- v1.17: the hardware, as the OS sees it ------------------------------------------------
+ * Most custom-chip registers are write-only, so the copper list, sprites and palette come from
+ * graphics.library's own records; the PC side decodes them (and reads the copper list and the
+ * sprite data with PEEK - they are in chip RAM).  The few registers that CAN be read without
+ * side effects are read here: DMACONR, VPOSR, VHPOSR, ADKCONR, INTENAR, INTREQR, DENISEID. */
+
+static void do_gfx(UBYTE op)
+{
+    struct Screen *scr;
+    g_textlen = 0;
+    if (op == 1) {
+        static ULONG rgb[256 * 3];
+        ULONG n, i;
+        Forbid();
+        scr = IntuitionBase->FirstScreen;
+        if (scr && scr->ViewPort.ColorMap) {
+            n = scr->ViewPort.ColorMap->Count;
+            if (n > 256) n = 256;
+            GetRGB32(scr->ViewPort.ColorMap, 0, n, rgb);
+            Permit();
+            tputs("SCREEN "); tputq((const char *)scr->Title); tputs(" "); tputnum((LONG)n); tputs("\n");
+            for (i = 0; i < n; i++) {
+                tputs("P "); tputnum((LONG)i); tputs(" ");
+                tputnum((LONG)(rgb[i * 3] >> 24)); tputs(" ");
+                tputnum((LONG)(rgb[i * 3 + 1] >> 24)); tputs(" ");
+                tputnum((LONG)(rgb[i * 3 + 2] >> 24)); tputs("\n");
+            }
+        } else { Permit(); tputs("SCREEN \"\" 0\n"); }
+        send_text();
+        return;
+    }
+    {
+        volatile UWORD *cust = (volatile UWORD *)0xDFF000;
+        struct SimpleSprite **ss;
+        int i;
+        tputs("GFX "); tputhex((ULONG)GfxBase);
+        tputs(" lof "); tputhex((ULONG)GfxBase->LOFlist);
+        tputs(" shf "); tputhex((ULONG)GfxBase->SHFlist);
+        tputs(" view "); tputhex((ULONG)GfxBase->ActiView);
+        tputs(" copinit "); tputhex((ULONG)GfxBase->copinit);
+        tputs(" chiprev "); tputnum(GfxBase->ChipRevBits0);
+        tputs(" display "); tputnum(GfxBase->DisplayFlags);
+        tputs(" interlace "); tputnum(GfxBase->ActiView ? (GfxBase->ActiView->Modes & LACE) != 0 : 0);
+        tputs("\n");
+        tputs("REGS dmaconr "); tputhex(cust[0x002 / 2]);
+        tputs(" vposr "); tputhex(cust[0x004 / 2]);
+        tputs(" vhposr "); tputhex(cust[0x006 / 2]);
+        tputs(" adkconr "); tputhex(cust[0x010 / 2]);
+        tputs(" intenar "); tputhex(cust[0x01C / 2]);
+        tputs(" intreqr "); tputhex(cust[0x01E / 2]);
+        tputs(" deniseid "); tputhex(cust[0x07C / 2]);
+        tputs("\n");
+        ss = GfxBase->SimpleSprites;
+        for (i = 0; i < 8; i++) {
+            struct SimpleSprite *sp = ss ? ss[i] : NULL;
+            tputs("SS "); tputnum(i); tputs(" "); tputhex((ULONG)sp);
+            if (sp) {
+                tputs(" "); tputnum(sp->x); tputs(" "); tputnum(sp->y);
+                tputs(" "); tputnum(sp->height); tputs(" "); tputnum(sp->num);
+                tputs(" "); tputhex((ULONG)sp->posctldata);
+            }
+            tputs("\n");
+        }
+        Forbid();
+        scr = IntuitionBase->FirstScreen;
+        if (scr) {
+            tputs("FRONT "); tputq((const char *)scr->Title); tputs(" ");
+            tputnum(scr->Width); tputs(" "); tputnum(scr->Height); tputs(" ");
+            tputnum(scr->BitMap.Depth); tputs(" ");
+            tputhex(GetVPModeID(&scr->ViewPort)); tputs("\n");
+        }
+        Permit();
+    }
+    send_text();
+}
+
 static void do_getfile(const UBYTE *p, UWORD plen)
 {
     char  path[256];
@@ -2054,6 +2135,10 @@ static WORD dispatch_one(const UBYTE *b, WORD avail)
         case CMD_CRASH:
             if (avail < 2) return 0;
             do_crash(b[1]);
+            return 2;
+        case CMD_GFX:
+            if (avail < 2) return 0;
+            do_gfx(b[1]);
             return 2;
         case CMD_LEAK:
             if (avail < 3) return 0;

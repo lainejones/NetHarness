@@ -36,6 +36,24 @@ a genuine click would.
 
 ## What's new (newest first)
 
+**New in 1.17** - the custom chips, as the OS sees them:
+
+- `CHIP` - the chipset (OCS/ECS/AGA, PAL/NTSC), which DMA channels are on (bitplanes, copper,
+  blitter, sprites, disk and the four audio channels), the interrupts enabled and pending, audio
+  modulation, the beam line, and the front screen's size, depth and mode ID.
+- `COPPER` - the copper lists on screen, decoded: graphics.library's start-up list (display
+  window, sprite pointers) and then the frame list (the screens' colours, bitplane pointers and
+  splits), with register names and the pointers put back together. `COPPER SHF` shows an
+  interlaced display's short frame.
+- `SPRITES` - the eight hardware sprites: where their data is, position, height, whether they are
+  attached, and who has them (sprite 0 is the mouse pointer; graphics parks unused ones on an
+  empty sprite).
+- `PALETTE` - the front screen's colours (24-bit on AGA).
+- Most custom-chip registers are write-only, so these come from graphics.library's own records
+  and from chip RAM; only the registers that can be read without side effects are read
+  (DMACONR, VPOSR, VHPOSR, ADKCONR, INTENAR, INTREQR, DENISEID). Audio is therefore which channels
+  are playing and their interrupts - Paula's period, volume and sample pointers can't be read back.
+
 **New in 1.16** - find memory leaks:
 
 - `LEAK START <program>`, then run the program. Every `AllocMem` and `AllocVec` it makes is

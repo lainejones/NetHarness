@@ -79,6 +79,13 @@ v1.16 - find leaks:
                             placed in its code (a block allocated inside a library also shows the
                             line in the program that called it)
   LEAK STOP | LEAK OFF      stop recording (keep the report) | also give exec its own functions back
+
+v1.17 - the hardware, as the OS sees it (most chip registers are write-only):
+  CHIP                      chipset, DMA channels (incl. the 4 audio channels), interrupts, beam, front screen
+  COPPER [SHF]              the copper lists on screen, decoded: graphics's start-up list (display
+                            window, sprite pointers), then the frame list (SHF: the interlace short frame)
+  SPRITES                   the 8 hardware sprites: data, position, height, attached, who has them
+  PALETTE                   the front screen's colours
   PUTFILE <local> <amiga>   copy a file onto the Amiga (deploy a binary!)
   RELOAD                    apply C:netharness.new + restart in place
                             (no reboot; REBOOT greyscreens some machines)
@@ -109,6 +116,7 @@ CMD_EXEC_P = 21                         # v1.11
 CMD_PEEK, CMD_POKE, CMD_TASKS, CMD_LIBS = 22, 23, 24, 25   # v1.14 inspection
 CMD_CRASH = 26                          # v1.15
 CMD_LEAK = 27                           # v1.16
+CMD_GFX = 28                            # v1.17
 RESP_TEXT = 0x85
 EXEC_TIMED_OUT = -2
 RESP_SCREENSHOT_HDR, RESP_ACK, RESP_EXEC = 0x81, 0x82, 0x83
@@ -627,6 +635,14 @@ class NetHarness:
         n = struct.unpack('>I', hdr[1:5])[0]
         return self._recv_exactly(n).decode('latin-1', 'replace') if n else ''
 
+    def gfx(self, op=0):
+        self.sock.sendall(bytes([CMD_GFX, op]))
+        hdr = self._recv_exactly(5)
+        if hdr[0] != RESP_TEXT:
+            raise ConnectionError(f'expected text response, got 0x{hdr[0]:02x}')
+        n = struct.unpack('>I', hdr[1:5])[0]
+        return self._recv_exactly(n).decode('latin-1', 'replace') if n else ''
+
     def crash(self, op=0):
         self.sock.sendall(bytes([CMD_CRASH, op]))
         hdr = self._recv_exactly(5)
@@ -837,6 +853,27 @@ def run_command(nh, argv):
             if w:
                 print('; %s, code segment %d, offset 0x%x' % w)
             print(nhinspect.disassemble(data, addr, a6, nh.libs(0) + nh.libs(1), count, peek=nh.peek))
+    elif cmd in ('CHIP', 'COPPER', 'SPRITES', 'PALETTE'):
+        import nhinspect
+        if not nh._at_least(1, 17):
+            print(f'{cmd} needs a 1.17+ harness (this one is {nh.version() or "older than 1.10"})', file=sys.stderr)
+            return 1
+        if cmd == 'PALETTE':
+            print(nhinspect.format_palette(nh.gfx(1)))
+        else:
+            info = nhinspect.parse_gfx(nh.gfx(0))
+            if cmd == 'CHIP':
+                print(nhinspect.format_chip(info))
+            elif cmd == 'COPPER':
+                if args and args[0].upper() == 'SHF':
+                    print(nhinspect.format_copper(nh.peek, info, 'shf'))
+                else:
+                    print('-- the start-up list (graphics.library copinit: display window, sprite pointers):')
+                    print(nhinspect.format_copper(nh.peek, info, 'copinit'))
+                    print('-- the frame list (the screens: colours, bitplane pointers, splits):')
+                    print(nhinspect.format_copper(nh.peek, info, 'lof'))
+            else:
+                print(nhinspect.format_sprites(nh.peek, info))
     elif cmd == 'LEAK':
         import nhinspect
         if not nh._at_least(1, 16):

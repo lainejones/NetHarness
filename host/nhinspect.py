@@ -361,3 +361,199 @@ def format_leak(text, libs_text='', running=None):
     if not ents and running is False:
         out.append('nothing left over - no leaks')
     return '\n'.join(out)
+
+
+# ---- hardware views (1.17) --------------------------------------------------------------------
+
+CUSTOM = {
+    0x000: 'BLTDDAT', 0x002: 'DMACONR', 0x004: 'VPOSR', 0x006: 'VHPOSR', 0x008: 'DSKDATR', 0x00A: 'JOY0DAT',
+    0x00C: 'JOY1DAT', 0x00E: 'CLXDAT', 0x010: 'ADKCONR', 0x012: 'POT0DAT', 0x014: 'POT1DAT', 0x016: 'POTGOR',
+    0x018: 'SERDATR', 0x01A: 'DSKBYTR', 0x01C: 'INTENAR', 0x01E: 'INTREQR', 0x020: 'DSKPTH', 0x022: 'DSKPTL',
+    0x024: 'DSKLEN', 0x026: 'DSKDAT', 0x028: 'REFPTR', 0x02A: 'VPOSW', 0x02C: 'VHPOSW', 0x02E: 'COPCON',
+    0x030: 'SERDAT', 0x032: 'SERPER', 0x034: 'POTGO', 0x036: 'JOYTEST', 0x038: 'STREQU', 0x03A: 'STRVBL',
+    0x03C: 'STRHOR', 0x03E: 'STRLONG', 0x040: 'BLTCON0', 0x042: 'BLTCON1', 0x044: 'BLTAFWM', 0x046: 'BLTALWM',
+    0x048: 'BLTCPTH', 0x04A: 'BLTCPTL', 0x04C: 'BLTBPTH', 0x04E: 'BLTBPTL', 0x050: 'BLTAPTH', 0x052: 'BLTAPTL',
+    0x054: 'BLTDPTH', 0x056: 'BLTDPTL', 0x058: 'BLTSIZE', 0x05A: 'BLTCON0L', 0x05C: 'BLTSIZV', 0x05E: 'BLTSIZH',
+    0x060: 'BLTCMOD', 0x062: 'BLTBMOD', 0x064: 'BLTAMOD', 0x066: 'BLTDMOD', 0x070: 'BLTCDAT', 0x072: 'BLTBDAT',
+    0x074: 'BLTADAT', 0x078: 'SPRHDAT', 0x07A: 'BPLHDAT', 0x07C: 'DENISEID', 0x07E: 'DSKSYNC',
+    0x080: 'COP1LCH', 0x082: 'COP1LCL', 0x084: 'COP2LCH', 0x086: 'COP2LCL', 0x088: 'COPJMP1', 0x08A: 'COPJMP2',
+    0x08C: 'COPINS', 0x08E: 'DIWSTRT', 0x090: 'DIWSTOP', 0x092: 'DDFSTRT', 0x094: 'DDFSTOP', 0x096: 'DMACON',
+    0x098: 'CLXCON', 0x09A: 'INTENA', 0x09C: 'INTREQ', 0x09E: 'ADKCON',
+    0x0F0: 'BPL1DAT', 0x0F2: 'BPL2DAT', 0x0F4: 'BPL3DAT', 0x0F6: 'BPL4DAT', 0x0F8: 'BPL5DAT', 0x0FA: 'BPL6DAT',
+    0x0FC: 'BPL7DAT', 0x0FE: 'BPL8DAT',
+    0x100: 'BPLCON0', 0x102: 'BPLCON1', 0x104: 'BPLCON2', 0x106: 'BPLCON3', 0x108: 'BPL1MOD', 0x10A: 'BPL2MOD',
+    0x10C: 'BPLCON4', 0x10E: 'CLXCON2', 0x1C0: 'HTOTAL', 0x1C2: 'HSSTOP', 0x1C4: 'HBSTRT', 0x1C6: 'HBSTOP',
+    0x1C8: 'VTOTAL', 0x1CA: 'VSSTOP', 0x1CC: 'VBSTRT', 0x1CE: 'VBSTOP', 0x1D0: 'SPRHSTRT', 0x1D2: 'SPRHSTOP',
+    0x1D4: 'BPLHSTRT', 0x1D6: 'BPLHSTOP', 0x1D8: 'HHPOSW', 0x1DA: 'HHPOSR', 0x1DC: 'BEAMCON0', 0x1DE: 'HSSTRT',
+    0x1E0: 'VSSTRT', 0x1E2: 'HCENTER', 0x1E4: 'DIWHIGH', 0x1E6: 'BPLHMOD', 0x1E8: 'SPRHPTH', 0x1EA: 'SPRHPTL',
+    0x1EC: 'BPLHPTH', 0x1EE: 'BPLHPTL', 0x1FC: 'FMODE',
+}
+for _i in range(4):
+    for _j, _n in enumerate(('PTH', 'PTL', 'LEN', 'PER', 'VOL', 'DAT')):
+        CUSTOM[0x0A0 + _i * 0x10 + _j * 2] = 'AUD%d%s' % (_i, _n)
+for _i in range(8):
+    CUSTOM[0x0E0 + _i * 4] = 'BPL%dPTH' % (_i + 1); CUSTOM[0x0E2 + _i * 4] = 'BPL%dPTL' % (_i + 1)
+    CUSTOM[0x120 + _i * 4] = 'SPR%dPTH' % _i; CUSTOM[0x122 + _i * 4] = 'SPR%dPTL' % _i
+    for _j, _n in enumerate(('POS', 'CTL', 'DATA', 'DATB')):
+        CUSTOM[0x140 + _i * 8 + _j * 2] = 'SPR%d%s' % (_i, _n)
+for _i in range(32):
+    CUSTOM[0x180 + _i * 2] = 'COLOR%02d' % _i
+
+
+def parse_gfx(text):
+    info = {'ss': []}
+    for line in text.splitlines():
+        p = line.split()
+        if not p:
+            continue
+        if p[0] in ('GFX', 'REGS'):
+            kv = dict(zip(p[1 if p[0] == 'REGS' else 2::2], p[2 if p[0] == 'REGS' else 3::2]))
+            if p[0] == 'GFX':
+                info['gfxbase'] = int(p[1], 16)
+            for k, v in kv.items():
+                info[k] = int(v, 16) if v.startswith('0x') else int(v)
+        elif p[0] == 'SS':
+            info['ss'].append(p[1:])
+        elif p[0] == 'FRONT':
+            r = parse_records(line, 'FRONT')[0]
+            info['front'] = {'title': r[0], 'w': int(r[1]), 'h': int(r[2]), 'depth': int(r[3]), 'mode': int(r[4], 16)}
+    return info
+
+
+def chipset_name(info):
+    rev = info.get('chiprev', 0)
+    return 'AGA' if rev & 4 else 'ECS' if rev & 3 else 'OCS'
+
+
+def read_copper(peek, addr, max_words=4096):
+    """[(address, w1, w2)] of a copper list up to its end (WAIT $FFFF,$FFFE)"""
+    import struct
+    out, chunk = [], b''
+    pos = 0
+    while len(out) < max_words // 2:
+        if pos + 4 > len(chunk):
+            chunk = chunk[pos:] + peek(addr + len(out) * 4 + (len(chunk) - pos), 1024)
+            pos = 0
+        w1, w2 = struct.unpack('>HH', chunk[pos:pos + 4])
+        out.append((addr + len(out) * 4, w1, w2))
+        pos += 4
+        if w1 == 0xFFFF and w2 == 0xFFFE:
+            break
+    return out
+
+
+def format_copper(peek, info, which='lof'):
+    addr = info.get(which, 0)
+    if not addr:
+        return 'no %s copper list' % ('short-frame' if which == 'shf' else 'copper')
+    ins = read_copper(peek, addr)
+    out = ['copper list at 0x%08x (%s, %d instructions)%s' % (addr, chipset_name(info), len(ins),
+           '' if ins and ins[-1][1:] == (0xFFFF, 0xFFFE) else ' - no end found, cut short')]
+    hi = {}
+    for a, w1, w2 in ins:
+        if not w1 & 1:
+            reg = w1 & 0x1FE
+            name = CUSTOM.get(reg, '$%03X' % reg)
+            note = ''
+            if name.endswith('PTH'):
+                hi[name[:-1]] = w2
+            elif name.endswith('PTL') and name[:-1] in hi:
+                note = '  ; %s = 0x%08x' % (name[:-3] + 'PT', (hi[name[:-1]] << 16) | w2)
+            out.append('  %08x  MOVE  %04x -> %-9s%s' % (a, w2, name, note))
+        elif w1 == 0xFFFF and w2 == 0xFFFE:
+            out.append('  %08x  END' % a)
+        else:
+            vp, hp, ve, he = w1 >> 8, w1 & 0xFE, (w2 >> 8) & 0x7F, w2 & 0xFE
+            op = 'SKIP' if w2 & 1 else 'WAIT'
+            out.append('  %08x  %s  line %d, hpos %d%s%s' % (a, op, vp, hp,
+                       '' if ve == 0x7F and he == 0xFE else '  (mask v=%02x h=%02x)' % (ve, he),
+                       '' if w2 & 0x8000 else '  (blitter-finished)'))
+    return '\n'.join(out)
+
+
+def format_sprites(peek, info):
+    """the 8 hardware sprites: where their data is (from the copper list), position, height, attached"""
+    import struct
+    pts = {}
+    for lst in ('copinit', 'lof'):            # graphics sets the pointers in its start-up list (copinit)
+        if not info.get(lst):
+            continue
+        hi = {}
+        for a, w1, w2 in read_copper(peek, info[lst]):
+            if w1 & 1:
+                continue
+            reg = w1 & 0x1FE
+            if 0x120 <= reg < 0x140:
+                n, lo = (reg - 0x120) // 4, (reg - 0x120) % 4
+                if lo == 0:
+                    hi[n] = w2
+                elif n in hi:
+                    pts[n] = (hi[n] << 16) | w2
+    out = ['%-3s %-10s %-10s %6s %6s %6s %-8s %s' % ('#', 'DATA', 'SLOT', 'X', 'Y', 'HEIGHT', 'ATTACHED', 'NOTE')]
+    for n in range(8):
+        slot = info['ss'][n] if n < len(info['ss']) else [str(n), '0x00000000']
+        used = slot[1] != '0x00000000'
+        ptr = pts.get(n)
+        x = y = h = '-'
+        att = ''
+        if ptr:
+            try:
+                pos, ctl = struct.unpack('>HH', peek(ptr, 4))
+                vstart = (pos >> 8) | ((ctl & 4) << 6)
+                vstop = (ctl >> 8) | ((ctl & 2) << 7)
+                hstart = ((pos & 0xFF) << 1) | (ctl & 1)
+                if pos or ctl:
+                    x, y, h = hstart, vstart, max(0, vstop - vstart)
+                att = 'yes' if ctl & 0x80 else ''
+            except Exception:
+                pass
+        shared = ptr and sum(1 for v in pts.values() if v == ptr) > 1
+        note = 'the mouse pointer' if n == 0 and used else ('allocated (GetSprite)' if used else
+               "blank (graphics' empty sprite)" if shared and x == '-' else '')
+        out.append('%-3d %-10s %-10s %6s %6s %6s %-8s %s' % (n, ('0x%08x' % ptr) if ptr else '-', slot[1] if used else '-',
+                                                             x, y, h, att, note))
+    out.append('(X/Y in hardware sprite coordinates - lores pixels, from the display window edge)')
+    return '\n'.join(out)
+
+
+def format_chip(info):
+    d = info.get('dmaconr', 0)
+    ie, ir, adk = info.get('intenar', 0), info.get('intreqr', 0), info.get('adkconr', 0)
+    vpos = ((info.get('vposr', 0) & 7) << 8) | (info.get('vhposr', 0) >> 8)
+    dma = [('bitplanes', 8), ('copper', 7), ('blitter', 6), ('sprites', 5), ('disk', 4),
+           ('audio 0', 0), ('audio 1', 1), ('audio 2', 2), ('audio 3', 3)]
+    ints = [('TBE', 0), ('DSKBLK', 1), ('SOFT', 2), ('PORTS', 3), ('COPER', 4), ('VERTB', 5), ('BLIT', 6),
+            ('AUD0', 7), ('AUD1', 8), ('AUD2', 9), ('AUD3', 10), ('RBF', 11), ('DSKSYN', 12), ('EXTER', 13)]
+    out = ['chipset: %s  (DENISEID 0x%04x, ChipRevBits0 %d)%s' % (chipset_name(info), info.get('deniseid', 0) & 0xFFFF,
+           info.get('chiprev', 0), '  PAL' if info.get('display', 0) & 4 else '  NTSC' if info.get('display', 0) & 1 else '')]
+    out.append('DMA master %s:  ' % ('ON' if d & 0x200 else 'OFF') +
+               '  '.join('%s %s' % (n, 'on' if d & (1 << b) else 'off') for n, b in dma))
+    if d & 0x4000:
+        out.append('the blitter is BUSY right now' + (' (zero flag set)' if d & 0x2000 else ''))
+    out.append('interrupts master %s; enabled: %s' % ('ON' if ie & 0x4000 else 'OFF',
+               ' '.join(n for n, b in ints if ie & (1 << b)) or 'none'))
+    out.append('pending: %s' % (' '.join(n for n, b in ints if ir & (1 << b)) or 'none'))
+    mods = ['audio %d modulates %d\'s %s' % (c, c + 1, 'volume' if b < 4 else 'period')
+            for b, c in [(0, 0), (1, 1), (2, 2), (4, 0), (5, 1), (6, 2)] if adk & (1 << b)]
+    out.append('audio: %s; modulation: %s' % (
+        ', '.join('channel %d %s' % (c, 'playing' if d & 0x200 and d & (1 << c) else 'idle') for c in range(4)),
+        ', '.join(mods) or 'none'))
+    out.append('beam: line %d  (the copper list, sprites and screens: COPPER, SPRITES, PALETTE)' % vpos)
+    if 'front' in info:
+        f = info['front']
+        out.append('front screen: "%s" %dx%d, %d bitplanes, mode ID 0x%08x' % (f['title'], f['w'], f['h'], f['depth'], f['mode']))
+    return '\n'.join(out)
+
+
+def format_palette(text):
+    out, cols = [], []
+    for line in text.splitlines():
+        if line.startswith('SCREEN '):
+            r = parse_records(line, 'SCREEN')[0]
+            out.append('palette of "%s": %s colours' % (r[0], r[1]))
+        elif line.startswith('P '):
+            i, r, g, b = (int(x) for x in line.split()[1:5])
+            cols.append('%3d #%02x%02x%02x' % (i, r, g, b))
+    for i in range(0, len(cols), 8):
+        out.append('  ' + '  '.join(cols[i:i + 8]))
+    return '\n'.join(out)
