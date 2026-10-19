@@ -127,7 +127,7 @@
  * deployed on several machines, "which build is on this one?" needs to be a
  * one-liner rather than a guess from the file size. Date is DD.MM.YYYY.
  * BUMP NH_VERSION whenever the wire protocol or commands change. */
-#define NH_VERSION "1.17"
+#define NH_VERSION "1.18"
 #define NH_VERDATE "18.10.2026"
 static const char verstag[] __attribute__((used)) =
     "$VER: netharness " NH_VERSION " (" NH_VERDATE ")";
@@ -536,16 +536,26 @@ static void do_screenshot_region(WORD x0, WORD y0, WORD rw, WORD rh)
     /* the FRONT screen - what the monitor shows.  Up to 1.10 this was the
      * active screen: with a game's screen active behind the Workbench (left
      * Amiga + N) the picture went on showing the game. */
+    hdr[0] = RESP_SCREENSHOT_HDR;
     scr = IntuitionBase->FirstScreen;
-    if (!scr) return;
+    if (scr) {
+        /* clamp the requested region to the screen */
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (rw <= 0 || rw > scr->Width  - x0) rw = (WORD)(scr->Width  - x0);
+        if (rh <= 0 || rh > scr->Height - y0) rh = (WORD)(scr->Height - y0);
+    }
+    if (!scr || rw <= 0 || rh <= 0) {
+        /* 1.18: always answer. No screen yet (early in the boot) or nothing of
+         * the region on it: "can't capture" (0xFE, which every client knows)
+         * with a 0 x 0 size, instead of leaving the client waiting. */
+        memset(hdr + 1, 0, sizeof(hdr) - 1);
+        hdr[5] = 0xFE;
+        send_all(hdr, sizeof(hdr));
+        return;
+    }
 
     rp = &scr->RastPort;
-    /* clamp the requested region to the screen */
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (rw <= 0 || rw > scr->Width  - x0) rw = (WORD)(scr->Width  - x0);
-    if (rh <= 0 || rh > scr->Height - y0) rh = (WORD)(scr->Height - y0);
-    if (rw <= 0 || rh <= 0) return;
 
     width  = (UWORD)rw;
     height = (UWORD)rh;
@@ -594,7 +604,11 @@ static void do_screenshot_region(WORD x0, WORD y0, WORD rw, WORD rh)
 
     chunky = AllocVec((ULONG)stride * SHOT_BAND_H, MEMF_PUBLIC);
     tmpbm  = AllocBitMap(stride, SHOT_BAND_H, depth, 0, rp->BitMap);
-    if (!chunky || !tmpbm) goto out;
+    if (!chunky || !tmpbm) {               /* 1.18: answer, don't leave the client waiting */
+        hdr[5] = 0xFE; hdr[6] = 0; hdr[7] = 0;
+        send_all(hdr, sizeof(hdr));
+        goto out;
+    }
     trp = *rp;
     trp.Layer  = NULL;
     trp.BitMap = tmpbm;

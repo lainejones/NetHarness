@@ -505,6 +505,8 @@ class NetHarness:
         width, height, depth, bpr = struct.unpack('>HHBH', hdr[1:8])
 
         if depth == 0xFE:
+            if width == 0 and height == 0:
+                raise RuntimeError('no screen to capture (none open yet, or the region is off it)')
             raise RuntimeError('capture unsupported (no cybergraphics.library / no memory)')
 
         if depth == 0xFD:
