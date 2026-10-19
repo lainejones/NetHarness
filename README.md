@@ -36,6 +36,11 @@ a genuine click would.
 
 ## What's new (newest first)
 
+**New in 1.18** - `SCREENSHOT` and `SHOTREGION` always answer. With no screen open yet
+(early in a boot), a region entirely off the screen, or no memory for the buffer, 1.17 sent
+nothing and the client waited for its timeout; 1.18 replies at once and `nhctl.py` says
+"no screen to capture". Nothing else changed: the PC tools need no update for 1.17 machines.
+
 **New in 1.17** - the custom chips, as the OS sees them:
 
 - `CHIP` - the chipset (OCS/ECS/AGA, PAL/NTSC), which DMA channels are on (bitplanes, copper,
@@ -424,7 +429,7 @@ The binary carries a standard AmigaDOS version cookie:
 
 ```
 $ nhctl.py --host <ip> EXEC "version C:netharness full"
-netharness 1.17 (18.10.2026)
+netharness 1.18 (18.10.2026)
 ```
 
 (The 1.12 package carries the 1.11 binary: only the PC window changed. The
