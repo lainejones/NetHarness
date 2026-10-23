@@ -20,7 +20,7 @@ clean:
 #     LhA -r a NetHarness-<version>.lha NetHarness NetHarness.info
 # VERSION is the package version; the binary's own version is NH_VERSION in
 # netharness.c.
-VERSION  = 1.17
+VERSION  = 1.18
 DISTFILE = NetHarness-$(VERSION)
 
 # "make dist" leaves, in ../dist:
